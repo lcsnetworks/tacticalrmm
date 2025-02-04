@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 
-SCRIPT_VERSION="30"
+SCRIPT_VERSION="32"
+
+export DEBIAN_FRONTEND=noninteractive
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -14,6 +16,11 @@ if [ $EUID -eq 0 ]; then
 fi
 
 if [[ $* == *--schedule* ]]; then
+    if ! sudo -n true 2>/dev/null; then
+        echo -ne "${RED}Error: Passwordless sudo is required for scheduling.${NC}\n"
+        exit 1
+    fi
+    
     (
         crontab -l 2>/dev/null
         echo "0 0 * * * /rmm/backup.sh --auto > /dev/null 2>&1"
@@ -68,11 +75,12 @@ mkdir ${tmp_dir}/nginx
 mkdir ${tmp_dir}/systemd
 mkdir ${tmp_dir}/rmm
 mkdir ${tmp_dir}/confd
+mkdir ${tmp_dir}/opt
 
 POSTGRES_USER=$(/rmm/api/env/bin/python /rmm/api/tacticalrmm/manage.py get_config dbuser)
 POSTGRES_PW=$(/rmm/api/env/bin/python /rmm/api/tacticalrmm/manage.py get_config dbpw)
 
-pg_dump --dbname=postgresql://"${POSTGRES_USER}":"${POSTGRES_PW}"@localhost:5432/tacticalrmm | gzip -9 >${tmp_dir}/postgres/db-${dt_now}.psql.gz
+pg_dump --no-privileges --no-owner --dbname=postgresql://"${POSTGRES_USER}":"${POSTGRES_PW}"@localhost:5432/tacticalrmm | gzip -9 >${tmp_dir}/postgres/db-${dt_now}.psql.gz
 
 node /meshcentral/node_modules/meshcentral --dbexport # for import to postgres
 
@@ -82,7 +90,7 @@ if grep -q postgres "/meshcentral/meshcentral-data/config.json"; then
     fi
     MESH_POSTGRES_USER=$(jq '.settings.postgres.user' /meshcentral/meshcentral-data/config.json -r)
     MESH_POSTGRES_PW=$(jq '.settings.postgres.password' /meshcentral/meshcentral-data/config.json -r)
-    pg_dump --dbname=postgresql://"${MESH_POSTGRES_USER}":"${MESH_POSTGRES_PW}"@localhost:5432/meshcentral | gzip -9 >${tmp_dir}/postgres/mesh-db-${dt_now}.psql.gz
+    pg_dump --no-privileges --no-owner --dbname=postgresql://"${MESH_POSTGRES_USER}":"${MESH_POSTGRES_PW}"@localhost:5432/meshcentral | gzip -9 >${tmp_dir}/postgres/mesh-db-${dt_now}.psql.gz
 else
     mongodump --gzip --out=${tmp_dir}/meshcentral/mongo
 fi
@@ -91,6 +99,10 @@ tar -czvf ${tmp_dir}/meshcentral/mesh.tar.gz --exclude=/meshcentral/node_modules
 
 if [ -d /etc/letsencrypt ]; then
     sudo tar -czvf ${tmp_dir}/certs/etc-letsencrypt.tar.gz -C /etc/letsencrypt .
+fi
+
+if [ -d /opt/tactical ]; then
+    sudo tar -czvf ${tmp_dir}/opt/opt-tactical.tar.gz -C /opt/tactical .
 fi
 
 local_settings='/rmm/api/tacticalrmm/tacticalrmm/local_settings.py'

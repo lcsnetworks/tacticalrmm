@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-SCRIPT_VERSION="53"
+SCRIPT_VERSION="61"
 SCRIPT_URL='https://raw.githubusercontent.com/amidaware/tacticalrmm/master/restore.sh'
 
 sudo apt update
@@ -13,8 +13,9 @@ RED='\033[0;31m'
 NC='\033[0m'
 
 SCRIPTS_DIR='/opt/trmm-community-scripts'
-PYTHON_VER='3.11.4'
+PYTHON_VER='3.11.8'
 SETTINGS_FILE='/rmm/api/tacticalrmm/tacticalrmm/settings.py'
+local_settings='/rmm/api/tacticalrmm/tacticalrmm/local_settings.py'
 
 TMP_FILE=$(mktemp -p "" "rmmrestore_XXXXXXXXXX")
 curl -s -L "${SCRIPT_URL}" >${TMP_FILE}
@@ -28,6 +29,13 @@ if [ "${SCRIPT_VERSION}" -ne "${NEW_VER}" ]; then
 fi
 
 rm -f $TMP_FILE
+
+export DEBIAN_FRONTEND=noninteractive
+
+if [ -d /rmm/api/tacticalrmm ]; then
+  echo -ne "${RED}ERROR: Existing trmm installation found. The restore script must be run on a clean server, please re-read the docs.${NC}\n"
+  exit 1
+fi
 
 arch=$(uname -m)
 if [[ "$arch" != "x86_64" ]] && [[ "$arch" != "aarch64" ]]; then
@@ -65,6 +73,16 @@ elif [[ "$osname" == "ubuntu" ]]; then
   fi
 else
   not_supported
+  exit 1
+fi
+
+if dpkg -l | grep -qi turnkey; then
+  echo -ne "${RED}Turnkey linux is not supported. Please use the official debian/ubuntu ISO.${NC}\n"
+  exit 1
+fi
+
+if ps aux | grep -v grep | grep -qi webmin; then
+  echo -ne "${RED}Webmin running, should not be installed. Please use the official debian/ubuntu ISO.${NC}\n"
   exit 1
 fi
 
@@ -124,7 +142,7 @@ print_green 'Installing NodeJS'
 
 sudo mkdir -p /etc/apt/keyrings
 curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-NODE_MAJOR=18
+NODE_MAJOR=20
 echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_$NODE_MAJOR.x nodistro main" | sudo tee /etc/apt/sources.list.d/nodesource.list
 sudo apt update
 sudo apt install -y gcc g++ make
@@ -133,7 +151,7 @@ sudo npm install -g npm
 
 print_green 'Restoring Nginx'
 
-wget -qO - https://nginx.org/packages/keys/nginx_signing.key | sudo gpg --dearmor -o /etc/apt/keyrings/nginx-archive-keyring.gpg
+wget -qO - https://nginx.org/keys/nginx_signing.key | sudo gpg --dearmor -o /etc/apt/keyrings/nginx-archive-keyring.gpg
 
 nginxrepo="$(
   cat <<EOF
@@ -164,7 +182,7 @@ http {
         sendfile on;
         tcp_nopush on;
         types_hash_max_size 2048;
-        server_names_hash_bucket_size 64;
+        server_names_hash_bucket_size 256;
         include /etc/nginx/mime.types;
         default_type application/octet-stream;
         ssl_protocols TLSv1.2 TLSv1.3;
@@ -181,11 +199,6 @@ echo "${nginxconf}" | sudo tee $nginxdefaultconf >/dev/null
 
 for i in sites-available sites-enabled; do
   sudo mkdir -p /etc/nginx/$i
-done
-
-for i in rmm frontend meshcentral; do
-  sudo cp ${tmp_dir}/nginx/${i}.conf /etc/nginx/sites-available/
-  sudo ln -s /etc/nginx/sites-available/${i}.conf /etc/nginx/sites-enabled/${i}.conf
 done
 
 print_green 'Restoring certbot'
@@ -220,6 +233,17 @@ elif [ -d "${tmp_dir}/certs/selfsigned" ]; then
   cp -p ${tmp_dir}/certs/selfsigned/cert.pem $certdir
 fi
 
+print_green 'Restoring assets'
+if [ -f "$tmp_dir/opt/opt-tactical.tar.gz" ]; then
+  sudo mkdir -p /opt/tactical
+  sudo tar -xzf $tmp_dir/opt/opt-tactical.tar.gz -C /opt/tactical
+  sudo chown ${USER}:${USER} -R /opt/tactical
+else
+  sudo mkdir -p /opt/tactical/reporting/assets
+  sudo mkdir -p /opt/tactical/reporting/schemas
+  sudo chown -R ${USER}:${USER} /opt/tactical
+fi
+
 print_green 'Restoring celery configs'
 
 sudo mkdir /etc/conf.d
@@ -229,6 +253,35 @@ sudo chown ${USER}:${USER} -R /etc/conf.d
 print_green 'Restoring systemd services'
 
 sudo cp $tmp_dir/systemd/* /etc/systemd/system/
+
+# migrate daphne to uvicorn for older systems
+if ! grep -q uvicorn /etc/systemd/system/daphne.service; then
+  sudo rm -f /etc/systemd/system/daphne.service
+
+  uviservice="$(
+    cat <<EOF
+[Unit]
+Description=uvicorn daemon v1
+After=network.target
+
+[Service]
+User=${USER}
+Group=www-data
+WorkingDirectory=/rmm/api/tacticalrmm
+Environment="PATH=/rmm/api/env/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/rmm/api/env/bin/uvicorn --uds /rmm/daphne.sock --forwarded-allow-ips='*' tacticalrmm.asgi:application
+ExecStartPre=rm -f /rmm/daphne.sock
+ExecStartPre=rm -f /rmm/daphne.sock.lock
+Restart=always
+RestartSec=3s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  )"
+  echo "${uviservice}" | sudo tee /etc/systemd/system/daphne.service >/dev/null
+fi
+
 sudo systemctl daemon-reload
 
 print_green "Installing Python ${PYTHON_VER}"
@@ -318,14 +371,14 @@ fi
 
 print_green 'Creating MeshCentral DB'
 
-sudo -u postgres psql -c "CREATE DATABASE meshcentral"
-sudo -u postgres psql -c "CREATE USER ${MESH_POSTGRES_USER} WITH PASSWORD '${MESH_POSTGRES_PW}'"
-sudo -u postgres psql -c "ALTER ROLE ${MESH_POSTGRES_USER} SET client_encoding TO 'utf8'"
-sudo -u postgres psql -c "ALTER ROLE ${MESH_POSTGRES_USER} SET default_transaction_isolation TO 'read committed'"
-sudo -u postgres psql -c "ALTER ROLE ${MESH_POSTGRES_USER} SET timezone TO 'UTC'"
-sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE meshcentral TO ${MESH_POSTGRES_USER}"
-sudo -u postgres psql -c "ALTER DATABASE meshcentral OWNER TO ${MESH_POSTGRES_USER}"
-sudo -u postgres psql -c "GRANT USAGE, CREATE ON SCHEMA PUBLIC TO ${MESH_POSTGRES_USER}"
+sudo -iu postgres psql -c "CREATE DATABASE meshcentral"
+sudo -iu postgres psql -c "CREATE USER ${MESH_POSTGRES_USER} WITH PASSWORD '${MESH_POSTGRES_PW}'"
+sudo -iu postgres psql -c "ALTER ROLE ${MESH_POSTGRES_USER} SET client_encoding TO 'utf8'"
+sudo -iu postgres psql -c "ALTER ROLE ${MESH_POSTGRES_USER} SET default_transaction_isolation TO 'read committed'"
+sudo -iu postgres psql -c "ALTER ROLE ${MESH_POSTGRES_USER} SET timezone TO 'UTC'"
+sudo -iu postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE meshcentral TO ${MESH_POSTGRES_USER}"
+sudo -iu postgres psql -c "ALTER DATABASE meshcentral OWNER TO ${MESH_POSTGRES_USER}"
+sudo -iu postgres psql -c "GRANT USAGE, CREATE ON SCHEMA PUBLIC TO ${MESH_POSTGRES_USER}"
 
 if [ "$FROM_MONGO" = true ]; then
   print_green 'Converting mesh mongo to postgres'
@@ -361,7 +414,7 @@ mesh_pkg="$(
   cat <<EOF
 {
   "dependencies": {
-    "archiver": "5.3.1",
+    "archiver": "7.0.1",
     "meshcentral": "${MESH_VER}",
     "otplib": "10.2.3",
     "pg": "8.7.1",
@@ -393,20 +446,33 @@ sudo chmod +x /usr/local/bin/nats-api
 
 print_green 'Restoring the trmm database'
 
-pgusername=$(grep -w USER /rmm/api/tacticalrmm/tacticalrmm/local_settings.py | sed 's/^.*: //' | sed 's/.//' | sed -r 's/.{2}$//')
-pgpw=$(grep -w PASSWORD /rmm/api/tacticalrmm/tacticalrmm/local_settings.py | sed 's/^.*: //' | sed 's/.//' | sed -r 's/.{2}$//')
+pgusername=$(grep -w USER $local_settings | sed 's/^.*: //' | sed 's/.//' | sed -r 's/.{2}$//')
+pgpw=$(grep -w PASSWORD $local_settings | sed 's/^.*: //' | sed 's/.//' | sed -r 's/.{2}$//')
 
-sudo -u postgres psql -c "CREATE DATABASE tacticalrmm"
-sudo -u postgres psql -c "CREATE USER ${pgusername} WITH PASSWORD '${pgpw}'"
-sudo -u postgres psql -c "ALTER ROLE ${pgusername} SET client_encoding TO 'utf8'"
-sudo -u postgres psql -c "ALTER ROLE ${pgusername} SET default_transaction_isolation TO 'read committed'"
-sudo -u postgres psql -c "ALTER ROLE ${pgusername} SET timezone TO 'UTC'"
-sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE tacticalrmm TO ${pgusername}"
-sudo -u postgres psql -c "ALTER DATABASE tacticalrmm OWNER TO ${pgusername}"
-sudo -u postgres psql -c "GRANT USAGE, CREATE ON SCHEMA PUBLIC TO ${pgusername}"
+sudo -iu postgres psql -c "CREATE DATABASE tacticalrmm"
+sudo -iu postgres psql -c "CREATE USER ${pgusername} WITH PASSWORD '${pgpw}'"
+sudo -iu postgres psql -c "ALTER ROLE ${pgusername} SET client_encoding TO 'utf8'"
+sudo -iu postgres psql -c "ALTER ROLE ${pgusername} SET default_transaction_isolation TO 'read committed'"
+sudo -iu postgres psql -c "ALTER ROLE ${pgusername} SET timezone TO 'UTC'"
+sudo -iu postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE tacticalrmm TO ${pgusername}"
+sudo -iu postgres psql -c "ALTER DATABASE tacticalrmm OWNER TO ${pgusername}"
+sudo -iu postgres psql -c "GRANT USAGE, CREATE ON SCHEMA PUBLIC TO ${pgusername}"
 
 gzip -d $tmp_dir/postgres/db*.psql.gz
 PGPASSWORD=${pgpw} psql -h localhost -U ${pgusername} -d tacticalrmm -f $tmp_dir/postgres/db*.psql
+
+# for weasyprint
+if [[ "$osname" == "debian" ]]; then
+  count=$(dpkg -l | grep -E "libpango-1.0-0|libpangoft2-1.0-0" | wc -l)
+  if ! [ "$count" -eq 2 ]; then
+    sudo apt install -y libpango-1.0-0 libpangoft2-1.0-0
+  fi
+elif [[ "$osname" == "ubuntu" ]]; then
+  count=$(dpkg -l | grep -E "libpango-1.0-0|libharfbuzz0b|libpangoft2-1.0-0" | wc -l)
+  if ! [ "$count" -eq 3 ]; then
+    sudo apt install -y libpango-1.0-0 libharfbuzz0b libpangoft2-1.0-0
+  fi
+fi
 
 SETUPTOOLS_VER=$(grep "^SETUPTOOLS_VER" "$SETTINGS_FILE" | awk -F'[= "]' '{print $5}')
 WHEEL_VER=$(grep "^WHEEL_VER" "$SETTINGS_FILE" | awk -F'[= "]' '{print $5}')
@@ -419,15 +485,20 @@ pip install --no-cache-dir --upgrade pip
 pip install --no-cache-dir setuptools==${SETUPTOOLS_VER} wheel==${WHEEL_VER}
 pip install --no-cache-dir -r /rmm/api/tacticalrmm/requirements.txt
 python manage.py migrate
+python manage.py generate_json_schemas
 python manage.py collectstatic --no-input
 python manage.py create_natsapi_conf
 python manage.py create_uwsgi_conf
 python manage.py reload_nats
 python manage.py post_update_tasks
+echo "Running management commands...please wait..."
 API=$(python manage.py get_config api)
 WEB_VERSION=$(python manage.py get_config webversion)
-webdomain=$(python manage.py get_config webdomain)
+FRONTEND=$(python manage.py get_config webdomain)
 meshdomain=$(python manage.py get_config meshdomain)
+WEBTAR_URL=$(python manage.py get_webtar_url)
+CERT_PUB_KEY=$(python manage.py get_config certfile)
+CERT_PRIV_KEY=$(python manage.py get_config keyfile)
 deactivate
 
 print_green 'Restoring hosts file'
@@ -438,11 +509,120 @@ if grep -q manage_etc_hosts /etc/hosts; then
   sudo systemctl restart cloud-init >/dev/null
 fi
 
+print_green 'Restoring nginx configs'
+
+for i in frontend meshcentral; do
+  sudo cp ${tmp_dir}/nginx/${i}.conf /etc/nginx/sites-available/
+  sudo ln -s /etc/nginx/sites-available/${i}.conf /etc/nginx/sites-enabled/${i}.conf
+done
+
+if ! grep -q "location /assets/" $tmp_dir/nginx/rmm.conf; then
+  if [ -d "${tmp_dir}/certs/selfsigned" ]; then
+    CERT_PUB_KEY="${certdir}/cert.pem"
+    CERT_PRIV_KEY="${certdir}/key.pem"
+  fi
+  nginxrmm="$(
+    cat <<EOF
+server_tokens off;
+
+upstream tacticalrmm {
+    server unix:////rmm/api/tacticalrmm/tacticalrmm.sock;
+}
+
+map \$http_user_agent \$ignore_ua {
+    "~python-requests.*" 0;
+    "~go-resty.*" 0;
+    default 1;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${API};
+    return 301 https://\$server_name\$request_uri;
+}
+
+server {
+    listen 443 ssl reuseport;
+    listen [::]:443 ssl;
+    server_name ${API};
+    client_max_body_size 300M;
+    access_log /rmm/api/tacticalrmm/tacticalrmm/private/log/access.log combined if=\$ignore_ua;
+    error_log /rmm/api/tacticalrmm/tacticalrmm/private/log/error.log;
+    ssl_certificate ${CERT_PUB_KEY};
+    ssl_certificate_key ${CERT_PRIV_KEY};
+    
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    ssl_ciphers EECDH+AESGCM:EDH+AESGCM;
+    ssl_ecdh_curve secp384r1;
+    ssl_stapling on;
+    ssl_stapling_verify on;
+    add_header X-Content-Type-Options nosniff;
+    
+    location /static/ {
+        root /rmm/api/tacticalrmm;
+        add_header "Access-Control-Allow-Origin" "https://${FRONTEND}";
+    }
+
+    location /private/ {
+        internal;
+        add_header "Access-Control-Allow-Origin" "https://${FRONTEND}";
+        alias /rmm/api/tacticalrmm/tacticalrmm/private/;
+    }
+
+    location /assets/ {
+        internal;
+        add_header "Access-Control-Allow-Origin" "https://${FRONTEND}";
+        alias /opt/tactical/reporting/assets/;
+    }
+
+    location ~ ^/ws/ {
+        proxy_pass http://unix:/rmm/daphne.sock;
+
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_redirect     off;
+        proxy_set_header   Host \$host;
+        proxy_set_header   X-Real-IP \$remote_addr;
+        proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Host \$server_name;
+    }
+
+    location ~ ^/natsws {
+        proxy_pass http://127.0.0.1:9235;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host \$host;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header X-Forwarded-Host \$host:\$server_port;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location / {
+        uwsgi_pass  tacticalrmm;
+        include     /etc/nginx/uwsgi_params;
+        uwsgi_read_timeout 300s;
+        uwsgi_ignore_client_abort on;
+    }
+}
+EOF
+  )"
+  echo "${nginxrmm}" | sudo tee /etc/nginx/sites-available/rmm.conf >/dev/null
+else
+  sudo cp ${tmp_dir}/nginx/rmm.conf /etc/nginx/sites-available/
+fi
+sudo ln -s /etc/nginx/sites-available/rmm.conf /etc/nginx/sites-enabled/rmm.conf
+
 HAS_11=$(grep 127.0.1.1 /etc/hosts)
 if [[ $HAS_11 ]]; then
-  sudo sed -i "/127.0.1.1/s/$/ ${API} ${webdomain} ${meshdomain}/" /etc/hosts
+  sudo sed -i "/127.0.1.1/s/$/ ${API} ${FRONTEND} ${meshdomain}/" /etc/hosts
 else
-  echo "127.0.1.1 ${API} ${webdomain} ${meshdomain}" | sudo tee --append /etc/hosts >/dev/null
+  echo "127.0.1.1 ${API} ${FRONTEND} ${meshdomain}" | sudo tee --append /etc/hosts >/dev/null
 fi
 
 sudo systemctl enable nats.service
@@ -451,7 +631,7 @@ sudo systemctl start nats.service
 print_green 'Restoring the frontend'
 
 webtar="trmm-web-v${WEB_VERSION}.tar.gz"
-wget -q https://github.com/amidaware/tacticalrmm-web/releases/download/v${WEB_VERSION}/${webtar} -O /tmp/${webtar}
+wget -q ${WEBTAR_URL} -O /tmp/${webtar}
 sudo mkdir -p /var/www/rmm
 sudo tar -xzf /tmp/${webtar} -C /var/www/rmm
 echo "window._env_ = {PROD_URL: \"https://${API}\"}" | sudo tee /var/www/rmm/dist/env-config.js >/dev/null

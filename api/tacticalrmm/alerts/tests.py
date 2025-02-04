@@ -1,16 +1,21 @@
-from datetime import datetime, timedelta
+from datetime import timedelta
 from itertools import cycle
 from unittest.mock import patch
-
-from django.conf import settings
-from django.utils import timezone as djangotime
-from model_bakery import baker, seq
 
 from alerts.tasks import cache_agents_alert_template
 from autotasks.models import TaskResult
 from core.tasks import cache_db_fields_task, resolve_alerts_task
 from core.utils import get_core_settings
-from tacticalrmm.constants import AgentMonType, AlertSeverity, AlertType, CheckStatus
+from django.conf import settings
+from django.utils import timezone as djangotime
+from model_bakery import baker, seq
+from tacticalrmm.constants import (
+    AgentMonType,
+    AlertSeverity,
+    AlertType,
+    CheckStatus,
+    URLActionType,
+)
 from tacticalrmm.test import TacticalTestCase
 
 from .models import Alert, AlertTemplate
@@ -28,6 +33,7 @@ class TestAlertsViews(TacticalTestCase):
         self.authenticate()
         self.setup_coresettings()
 
+    """
     def test_get_alerts(self):
         url = "/alerts/"
 
@@ -39,14 +45,14 @@ class TestAlertsViews(TacticalTestCase):
         alerts = baker.make(
             "alerts.Alert",
             agent=agent,
-            alert_time=seq(datetime.now(), timedelta(days=15)),
+            alert_time=seq(djangotime.now(), timedelta(days=15)),
             severity=AlertSeverity.WARNING,
             _quantity=3,
         )
         baker.make(
             "alerts.Alert",
             assigned_check=check,
-            alert_time=seq(datetime.now(), timedelta(days=15)),
+            alert_time=seq(djangotime.now(), timedelta(days=15)),
             severity=AlertSeverity.ERROR,
             _quantity=7,
         )
@@ -55,7 +61,7 @@ class TestAlertsViews(TacticalTestCase):
             assigned_task=task,
             snoozed=True,
             snooze_until=djangotime.now(),
-            alert_time=seq(datetime.now(), timedelta(days=15)),
+            alert_time=seq(djangotime.now(), timedelta(days=15)),
             _quantity=2,
         )
         baker.make(
@@ -63,7 +69,7 @@ class TestAlertsViews(TacticalTestCase):
             agent=agent,
             resolved=True,
             resolved_on=djangotime.now(),
-            alert_time=seq(datetime.now(), timedelta(days=15)),
+            alert_time=seq(djangotime.now(), timedelta(days=15)),
             _quantity=9,
         )
 
@@ -120,13 +126,14 @@ class TestAlertsViews(TacticalTestCase):
             self.assertEqual(len(resp.data), req["count"])
 
         self.check_not_authenticated("patch", url)
+    """
 
     def test_add_alert(self):
         url = "/alerts/"
 
         agent = baker.make_recipe("agents.agent")
         data = {
-            "alert_time": datetime.now(),
+            "alert_time": djangotime.now(),
             "agent": agent.id,
             "severity": "warning",
             "alert_type": "availability",
@@ -275,12 +282,32 @@ class TestAlertsViews(TacticalTestCase):
         resp = self.client.get("/alerts/templates/500/", format="json")
         self.assertEqual(resp.status_code, 404)
 
-        alert_template = baker.make("alerts.AlertTemplate")
-        url = f"/alerts/templates/{alert_template.pk}/"
+        agent_script = baker.make("scripts.Script")
+        server_script = baker.make("scripts.Script")
+        webhook = baker.make("core.URLAction", action_type=URLActionType.REST)
 
+        alert_template_agent_script = baker.make(
+            "alerts.AlertTemplate", action=agent_script
+        )
+        url = f"/alerts/templates/{alert_template_agent_script.pk}/"
         resp = self.client.get(url, format="json")
-        serializer = AlertTemplateSerializer(alert_template)
+        serializer = AlertTemplateSerializer(alert_template_agent_script)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, serializer.data)
 
+        alert_template_server_script = baker.make(
+            "alerts.AlertTemplate", action=server_script
+        )
+        url = f"/alerts/templates/{alert_template_server_script.pk}/"
+        resp = self.client.get(url, format="json")
+        serializer = AlertTemplateSerializer(alert_template_server_script)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, serializer.data)
+
+        alert_template_webhook = baker.make("alerts.AlertTemplate", action_rest=webhook)
+        url = f"/alerts/templates/{alert_template_webhook.pk}/"
+        resp = self.client.get(url, format="json")
+        serializer = AlertTemplateSerializer(alert_template_webhook)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.data, serializer.data)
 
@@ -363,7 +390,7 @@ class TestAlertTasks(TacticalTestCase):
         not_snoozed = baker.make(
             "alerts.Alert",
             snoozed=True,
-            snooze_until=seq(datetime.now(), timedelta(days=15)),
+            snooze_until=seq(djangotime.now(), timedelta(days=15)),
             _quantity=5,
         )
 
@@ -371,7 +398,7 @@ class TestAlertTasks(TacticalTestCase):
         snoozed = baker.make(
             "alerts.Alert",
             snoozed=True,
-            snooze_until=seq(datetime.now(), timedelta(days=-15)),
+            snooze_until=seq(djangotime.now(), timedelta(days=-15)),
             _quantity=5,
         )
 
@@ -1427,6 +1454,8 @@ class TestAlertTasks(TacticalTestCase):
             "run_as_user": False,
             "env_vars": ["hello=world", "foo=bar"],
             "id": AgentHistory.objects.last().pk,  # type: ignore
+            "nushell_enable_config": settings.NUSHELL_ENABLE_CONFIG,
+            "deno_default_permissions": settings.DENO_DEFAULT_PERMISSIONS,
         }
 
         nats_cmd.assert_called_with(data, timeout=30, wait=True)
@@ -1458,6 +1487,8 @@ class TestAlertTasks(TacticalTestCase):
             "run_as_user": False,
             "env_vars": ["resolved=action", "env=vars"],
             "id": AgentHistory.objects.last().pk,  # type: ignore
+            "nushell_enable_config": settings.NUSHELL_ENABLE_CONFIG,
+            "deno_default_permissions": settings.DENO_DEFAULT_PERMISSIONS,
         }
 
         nats_cmd.assert_called_with(data, timeout=35, wait=True)

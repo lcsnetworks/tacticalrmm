@@ -2,10 +2,12 @@ import json
 import os
 from itertools import cycle
 from typing import TYPE_CHECKING
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 from zoneinfo import ZoneInfo
 
 from django.conf import settings
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone as djangotime
 from model_bakery import baker
 
@@ -768,6 +770,67 @@ class TestAgentViews(TacticalTestCase):
 
         self.assertEqual(Note.objects.get(agent=self.agent).note, "ok")
 
+        # test run on server
+        with patch("core.utils.run_server_script") as mock_run_server_script:
+            mock_run_server_script.return_value = ("output", "error", 1.23456789, 0)
+            data = {
+                "script": script.pk,
+                "output": "wait",
+                "args": ["arg1", "arg2"],
+                "timeout": 15,
+                "run_as_user": False,
+                "env_vars": ["key1=val1", "key2=val2"],
+                "run_on_server": True,
+            }
+
+            r = self.client.post(url, data, format="json")
+            self.assertEqual(r.status_code, 200)
+            hist = AgentHistory.objects.filter(agent=self.agent, script=script).last()
+            if not hist:
+                raise AgentHistory.DoesNotExist
+
+            mock_run_server_script.assert_called_with(
+                body=script.script_body,
+                args=script.parse_script_args(self.agent, script.shell, data["args"]),
+                env_vars=script.parse_script_env_vars(
+                    self.agent, script.shell, data["env_vars"]
+                ),
+                shell=script.shell,
+                timeout=18,
+            )
+
+            expected_ret = {
+                "stdout": "output",
+                "stderr": "error",
+                "execution_time": "1.2346",
+                "retcode": 0,
+            }
+
+            self.assertEqual(r.data, expected_ret)
+
+            hist.refresh_from_db()
+            expected_script_results = {**expected_ret, "id": hist.pk}
+            self.assertEqual(hist.script_results, expected_script_results)
+
+            # test run on server with server scripts disabled
+            with patch(
+                "core.models.CoreSettings.server_scripts_enabled",
+                new_callable=PropertyMock,
+            ) as server_scripts_enabled:
+                server_scripts_enabled.return_value = False
+
+                data = {
+                    "script": script.pk,
+                    "output": "wait",
+                    "args": ["arg1", "arg2"],
+                    "timeout": 15,
+                    "run_as_user": False,
+                    "env_vars": ["key1=val1", "key2=val2"],
+                    "run_on_server": True,
+                }
+                r = self.client.post(url, data, format="json")
+                self.assertEqual(r.status_code, 400)
+
     def test_get_notes(self):
         url = f"{base_url}/notes/"
 
@@ -869,7 +932,115 @@ class TestAgentViews(TacticalTestCase):
         ctx = {"default_tz": ZoneInfo("America/Los_Angeles")}
         data = AgentHistorySerializer(history, many=True, context=ctx).data
         self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.data, data)  # type:ignore
+        self.assertEqual(
+            sorted(r.data, key=lambda i: i["id"]),  # type: ignore
+            sorted(data, key=lambda i: i["id"]),
+        )
+
+    def test_get_agent_history_v2(self):
+        agent = baker.make_recipe("agents.agent")
+        script = baker.make("scripts.Script")
+        baker.make("agents.AgentHistory", agent=agent, script=script, _quantity=30)
+        other_agent = baker.make_recipe("agents.agent")
+        baker.make("agents.AgentHistory", agent=other_agent, _quantity=7)
+
+        url = f"{base_url}/v2/{agent.agent_id}/history/"
+
+        # test agent not found
+        r = self.client.get(
+            f"{base_url}/v2/{agent.agent_id}123/history/", format="json"
+        )
+        self.assertEqual(r.status_code, 404)
+
+        # scoped to agent, single page
+        r = self.client.get(url, format="json")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data["count"], 30)  # type: ignore
+        self.assertIsNone(r.data["next"])  # type: ignore
+        self.assertEqual(len(r.data["results"]), 30)  # type: ignore
+
+        # page traversal with custom page size
+        r = self.client.get(f"{url}?page_size=10&page=2", format="json")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data["count"], 30)  # type: ignore
+        self.assertEqual(len(r.data["results"]), 10)  # type: ignore
+        self.assertIsNotNone(r.data["next"])  # type: ignore
+        self.assertIsNotNone(r.data["previous"])  # type: ignore
+
+        # invalid page
+        r = self.client.get(f"{url}?page=999", format="json")
+        self.assertEqual(r.status_code, 404)
+
+        # unscoped is also paginated and includes all agents
+        r = self.client.get(f"{base_url}/v2/history/", format="json")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data["count"], 37)  # type: ignore
+
+        self.check_not_authenticated("get", url)
+
+    def test_get_agent_history_v2_ordering(self):
+        agent = baker.make_recipe("agents.agent")
+        for name in ("alice", "bob", "carol"):
+            baker.make("agents.AgentHistory", agent=agent, username=name)
+
+        url = f"{base_url}/v2/{agent.agent_id}/history/"
+
+        r = self.client.get(f"{url}?ordering=username", format="json")
+        self.assertEqual(
+            [i["username"] for i in r.data["results"]],  # type: ignore
+            ["alice", "bob", "carol"],
+        )
+
+        r = self.client.get(f"{url}?ordering=-username", format="json")
+        self.assertEqual(
+            [i["username"] for i in r.data["results"]],  # type: ignore
+            ["carol", "bob", "alice"],
+        )
+
+        # unknown ordering field falls back to newest first
+        r = self.client.get(f"{url}?ordering=agent__hostname", format="json")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(
+            [i["username"] for i in r.data["results"]],  # type: ignore
+            ["carol", "bob", "alice"],
+        )
+
+    def test_get_agent_history_v2_num_queries(self):
+        # query count must not grow with row count (no n+1 on script_name)
+        agent = baker.make_recipe("agents.agent")
+        script = baker.make("scripts.Script")
+        baker.make("agents.AgentHistory", agent=agent, script=script, _quantity=5)
+
+        url = f"{base_url}/v2/{agent.agent_id}/history/"
+
+        with CaptureQueriesContext(connection) as ctx_small:
+            r = self.client.get(url, format="json")
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(len(r.data["results"]), 5)  # type: ignore
+
+        baker.make("agents.AgentHistory", agent=agent, script=script, _quantity=95)
+
+        with CaptureQueriesContext(connection) as ctx_large:
+            r = self.client.get(url, format="json")
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(len(r.data["results"]), 100)  # type: ignore
+
+        self.assertEqual(
+            len(ctx_small.captured_queries), len(ctx_large.captured_queries)
+        )
+
+        # unscoped endpoint must be constant as well
+        with CaptureQueriesContext(connection) as ctx_all_small:
+            r = self.client.get(f"{base_url}/v2/history/?page_size=10", format="json")
+            self.assertEqual(r.status_code, 200)
+
+        with CaptureQueriesContext(connection) as ctx_all_large:
+            r = self.client.get(f"{base_url}/v2/history/?page_size=100", format="json")
+            self.assertEqual(r.status_code, 200)
+
+        self.assertEqual(
+            len(ctx_all_small.captured_queries), len(ctx_all_large.captured_queries)
+        )
 
 
 class TestAgentViewsNew(TacticalTestCase):
@@ -1020,7 +1191,6 @@ class TestAgentPermissions(TacticalTestCase):
             {"method": "post", "action": "recover", "role": "can_recover_agents"},
             {"method": "post", "action": "reboot", "role": "can_reboot_agents"},
             {"method": "patch", "action": "reboot", "role": "can_reboot_agents"},
-            {"method": "get", "action": "ping", "role": "can_ping_agents"},
             {"method": "get", "action": "meshcentral", "role": "can_use_mesh"},
             {"method": "post", "action": "meshcentral/recover", "role": "can_use_mesh"},
             {"method": "get", "action": "processes", "role": "can_manage_procs"},
@@ -1322,6 +1492,43 @@ class TestAgentPermissions(TacticalTestCase):
         self.assertEqual(len(r.data), 5)
 
         # make sure superusers work
+        self.check_authorized_superuser("get", url)
+        self.check_authorized_superuser("get", authorized_url)
+        self.check_authorized_superuser("get", unauthorized_url)
+
+    def test_get_agent_history_v2_permissions(self):
+        user = self.create_user_with_roles([])
+        self.client.force_authenticate(user=user)
+
+        sites = baker.make("clients.Site", _quantity=2)
+        agent = baker.make_recipe("agents.agent", site=sites[0])
+        baker.make("agents.AgentHistory", agent=agent, _quantity=5)
+        unauthorized_agent = baker.make_recipe("agents.agent", site=sites[1])
+        baker.make("agents.AgentHistory", agent=unauthorized_agent, _quantity=6)
+
+        url = f"{base_url}/v2/history/"
+        authorized_url = f"{base_url}/v2/{agent.agent_id}/history/"
+        unauthorized_url = f"{base_url}/v2/{unauthorized_agent.agent_id}/history/"
+
+        self.check_not_authorized("get", url)
+        self.check_not_authorized("get", authorized_url)
+        self.check_not_authorized("get", unauthorized_url)
+
+        user.role.can_list_agent_history = True
+        user.role.save()
+
+        r = self.check_authorized("get", url)
+        self.check_authorized("get", authorized_url)
+        self.check_authorized("get", unauthorized_url)
+        self.assertEqual(r.data["count"], 11)
+        self.assertEqual(len(r.data["results"]), 11)
+
+        user.role.can_view_clients.set([agent.client])
+        self.check_authorized("get", authorized_url)
+        self.check_not_authorized("get", unauthorized_url)
+        r = self.check_authorized("get", url)
+        self.assertEqual(r.data["count"], 5)
+
         self.check_authorized_superuser("get", url)
         self.check_authorized_superuser("get", authorized_url)
         self.check_authorized_superuser("get", unauthorized_url)

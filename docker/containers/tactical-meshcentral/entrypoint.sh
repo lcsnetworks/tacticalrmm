@@ -10,9 +10,10 @@ set -e
 : "${MONGODB_PORT:=27017}"
 : "${NGINX_HOST_IP:=172.20.0.20}"
 : "${NGINX_HOST_PORT:=4443}"
-: "${MESH_COMPRESSION_ENABLED:=true}"
+: "${MESH_COMPRESSION_ENABLED:=false}"
 : "${MESH_PERSISTENT_CONFIG:=0}"
 : "${MESH_WEBRTC_ENABLED:=false}"
+: "${MESH_AUTO_BACKUP:=false}"
 : "${WS_MASK_OVERRIDE:=0}"
 : "${SMTP_HOST:=smtp.example.com}"
 : "${SMTP_PORT:=587}"
@@ -25,7 +26,8 @@ if [ ! -f "/home/node/app/meshcentral-data/config.json" ] || [[ "${MESH_PERSISTE
 
   encoded_uri=$(node -p "encodeURI('mongodb://${MONGODB_USER}:${MONGODB_PASSWORD}@${MONGODB_HOST}:${MONGODB_PORT}')")
 
-  mesh_config="$(cat << EOF
+  mesh_config="$(
+    cat <<EOF
 {
   "settings": {
     "mongodb": "${encoded_uri}",
@@ -39,10 +41,10 @@ if [ ! -f "/home/node/app/meshcentral-data/config.json" ] || [[ "${MESH_PERSISTE
     "aliasPort": 443,
     "allowLoginToken": true,
     "allowFraming": true,
-    "_agentPing": 60,
-    "agentPong": 300,
+    "agentPing": 35,
     "allowHighQualityDesktop": true,
     "agentCoreDump": false,
+	"autoBackup": ${MESH_AUTO_BACKUP},
     "compression": ${MESH_COMPRESSION_ENABLED},
     "wsCompression": ${MESH_COMPRESSION_ENABLED},
     "agentWsCompression": ${MESH_COMPRESSION_ENABLED},
@@ -74,26 +76,26 @@ if [ ! -f "/home/node/app/meshcentral-data/config.json" ] || [[ "${MESH_PERSISTE
   }
 }
 EOF
-)"
+  )"
 
-  echo "${mesh_config}" > /home/node/app/meshcentral-data/config.json
+  echo "${mesh_config}" >/home/node/app/meshcentral-data/config.json
 fi
 
 node node_modules/meshcentral --createaccount ${MESH_USER} --pass ${MESH_PASS} --email example@example.com
 node node_modules/meshcentral --adminaccount ${MESH_USER}
 
 if [ ! -f "${TACTICAL_DIR}/tmp/mesh_token" ]; then
-    mesh_token=$(node node_modules/meshcentral --logintokenkey)
+  mesh_token=$(node node_modules/meshcentral --logintokenkey)
 
-    if [[ ${#mesh_token} -eq 160 ]]; then
-      echo ${mesh_token} > /opt/tactical/tmp/mesh_token
-    else
-      echo "Failed to generate mesh token. Fix the error and restart the mesh container"
-    fi
+  if [[ ${#mesh_token} -eq 160 ]]; then
+    echo ${mesh_token} >/opt/tactical/tmp/mesh_token
+  else
+    echo "Failed to generate mesh token. Fix the error and restart the mesh container"
+  fi
 fi
 
 # wait for nginx container
-until (echo > /dev/tcp/"${NGINX_HOST_IP}"/${NGINX_HOST_PORT}) &> /dev/null; do
+until (echo >/dev/tcp/"${NGINX_HOST_IP}"/${NGINX_HOST_PORT}) &>/dev/null; do
   echo "waiting for nginx to start..."
   sleep 5
 done

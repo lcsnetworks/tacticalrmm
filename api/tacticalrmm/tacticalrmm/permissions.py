@@ -4,6 +4,7 @@ from django.db.models import Q
 from django.shortcuts import get_object_or_404
 
 from agents.models import Agent
+from tacticalrmm.constants import AGENT_DEFER
 
 if TYPE_CHECKING:
     from accounts.models import User
@@ -25,6 +26,9 @@ def _has_perm(request, perm: str) -> bool:
 def _has_perm_on_agent(user: "User", agent_id: str) -> bool:
     from agents.models import Agent
 
+    if user.is_installer_user:
+        return False
+
     role = user.get_and_set_role_cache()
     if user.is_superuser or (role and getattr(role, "is_superuser")):
         return True
@@ -33,7 +37,10 @@ def _has_perm_on_agent(user: "User", agent_id: str) -> bool:
     elif not role:
         return False
 
-    agent = get_object_or_404(Agent, agent_id=agent_id)
+    agent = get_object_or_404(
+        Agent.objects.defer(*AGENT_DEFER).select_related("site__client"),
+        agent_id=agent_id,
+    )
     can_view_clients = role.can_view_clients.all() if role else None
     can_view_sites = role.can_view_sites.all() if role else None
 

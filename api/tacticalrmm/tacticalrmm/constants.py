@@ -1,5 +1,7 @@
+import zoneinfo
 from enum import Enum
 
+from django.conf import settings
 from django.db import models
 
 
@@ -19,6 +21,7 @@ class MeshAgentIdent(Enum):
 CORESETTINGS_CACHE_KEY = "core_settings"
 ROLE_CACHE_PREFIX = "role_"
 AGENT_TBL_PEND_ACTION_CNT_CACHE_PREFIX = "agent_tbl_pendingactions_"
+AGENT_CHECKS_CACHE_PREFIX = "agent_checks_data_"
 
 AGENT_STATUS_ONLINE = "online"
 AGENT_STATUS_OFFLINE = "offline"
@@ -29,6 +32,11 @@ RESOLVE_ALERTS_LOCK = "resolve-alerts-lock-key"
 SYNC_SCHED_TASK_LOCK = "sync-sched-tasks-lock-key"
 AGENT_OUTAGES_LOCK = "agent-outages-task-lock-key"
 ORPHANED_WIN_TASK_LOCK = "orphaned-win-task-lock-key"
+SYNC_MESH_PERMS_TASK_LOCK = "sync-mesh-perms-lock-key"
+CACHE_DB_FIELDS_TASK_LOCK = "cache-db-fields-task-lock-key"
+
+TRMM_WS_MAX_SIZE = getattr(settings, "TRMM_WS_MAX_SIZE", 100 * 2**20)
+TRMM_MAX_REQUEST_SIZE = getattr(settings, "TRMM_MAX_REQUEST_SIZE", 10 * 2**20)
 
 
 class GoArch(models.TextChoices):
@@ -66,6 +74,11 @@ class TaskStatus(models.TextChoices):
     PENDING = "pending", "Pending"
 
 
+class TaskRunStatus(models.TextChoices):
+    RUNNING = "running", "Running"
+    COMPLETED = "completed", "Completed"
+
+
 class TaskType(models.TextChoices):
     DAILY = "daily", "Daily"
     WEEKLY = "weekly", "Weekly"
@@ -74,6 +87,7 @@ class TaskType(models.TextChoices):
     CHECK_FAILURE = "checkfailure", "On Check Failure"
     MANUAL = "manual", "Manual"
     RUN_ONCE = "runonce", "Run Once"
+    ONBOARDING = "onboarding", "Onboarding"
     SCHEDULED = "scheduled", "Scheduled"  # deprecated
 
 
@@ -88,6 +102,12 @@ class AlertType(models.TextChoices):
     CHECK = "check", "Check"
     TASK = "task", "Task"
     CUSTOM = "custom", "Custom"
+
+
+class AlertTemplateActionType(models.TextChoices):
+    SCRIPT = "script", "Script"
+    SERVER = "server", "Server"
+    REST = "rest", "Rest"
 
 
 class AgentHistoryType(models.TextChoices):
@@ -130,6 +150,8 @@ class ScriptShell(models.TextChoices):
     CMD = "cmd", "Batch (CMD)"
     PYTHON = "python", "Python"
     SHELL = "shell", "Shell"
+    NUSHELL = "nushell", "Nushell"
+    DENO = "deno", "Deno"
 
 
 class ScriptType(models.TextChoices):
@@ -238,6 +260,30 @@ class DebugLogType(models.TextChoices):
     SCRIPTING = "scripting", "Scripting"
 
 
+class URLActionType(models.TextChoices):
+    WEB = "web", "Web"
+    REST = "rest", "Rest"
+
+
+class URLActionRestMethod(models.TextChoices):
+    GET = "get", "Get"
+    POST = "post", "Post"
+    PUT = "put", "Put"
+    DELETE = "delete", "Delete"
+    PATCH = "patch", "Patch"
+
+
+class ScheduleType(models.TextChoices):
+    DAILY = "daily", "Daily"
+    WEEKLY = "weekly", "Weekly"
+    MONTHLY = "monthly", "Monthly"
+
+
+class MonthlyType(models.TextChoices):
+    WEEKS = "weeks", "Weeks"
+    DAYS = "days", "Days"
+
+
 # Agent db fields that are not needed for most queries, speeds up query
 AGENT_DEFER = (
     "wmi_detail",
@@ -263,6 +309,7 @@ ONLINE_AGENTS = (
     "overdue_time",
     "offline_time",
     "version",
+    "plat",
 )
 
 FIELDS_TRIGGER_TASK_UPDATE_AGENT = [
@@ -313,6 +360,7 @@ POLICY_TASK_FIELDS_TO_COPY = [
     "run_asap_after_missed",
     "task_instance_policy",
     "continue_on_error",
+    "task_supported_platforms",
 ]
 
 CHECKS_NON_EDITABLE_FIELDS = [
@@ -336,6 +384,7 @@ POLICY_CHECK_FIELDS_TO_COPY = [
     "ip",
     "script",
     "script_args",
+    "success_return_codes",
     "info_return_codes",
     "warning_return_codes",
     "timeout",
@@ -393,6 +442,16 @@ WEEKS = {
     "Last Week": 0x10,
 }
 
+WEEKDAY_TO_BIT = {
+    0: 0x2,  # monday
+    1: 0x4,
+    2: 0x8,
+    3: 0x10,
+    4: 0x20,
+    5: 0x40,
+    6: 0x1,  # sunday
+}
+
 MONTH_DAYS = {f"{b}": 0x1 << a for a, b in enumerate(range(1, 32))}
 MONTH_DAYS["Last Day"] = 0x80000000
 
@@ -428,6 +487,29 @@ DEMO_NOT_ALLOWED = [
     {"name": "bulk_run_checks", "methods": ["GET"]},
     {"name": "OpenAICodeCompletion", "methods": ["POST"]},
     {"name": "wol", "methods": ["POST"]},
+    {"name": "Shutdown", "methods": ["POST"]},
+    {"name": "RunTestURLAction", "methods": ["POST"]},
+    {"name": "TestRunServerScript", "methods": ["POST"]},
+    {"name": "DeleteActiveLoginSession", "methods": ["DELETE"]},
+    {"name": "GetDeleteActiveLoginSessionsPerUser", "methods": ["DELETE"]},
+    {"name": "GetAddSSOProvider", "methods": ["POST"]},
+    {"name": "GetUpdateDeleteSSOProvider", "methods": ["PUT", "DELETE"]},
+    {"name": "DisconnectSSOAccount", "methods": ["DELETE"]},
+    {"name": "GetAccessToken", "methods": ["POST"]},
+    {"name": "GetUpdateSSOSettings", "methods": ["POST"]},
+    {"name": "ping", "methods": ["GET"]},
+    {"name": "GetAddAPIKeys", "methods": ["POST"]},
+    {"name": "GetUpdateDeleteAPIKey", "methods": ["PUT", "DELETE"]},
+    {"name": "WebVNC", "methods": ["GET"]},
+    {"name": "UninstallSoftware", "methods": ["POST"]},
+    {"name": "browse_registry", "methods": ["GET"]},
+    {"name": "create_registry_key", "methods": ["POST"]},
+    {"name": "delete_registry_key", "methods": ["DELETE"]},
+    {"name": "rename_registry_key", "methods": ["POST"]},
+    {"name": "create_registry_value", "methods": ["POST"]},
+    {"name": "delete_registry_value", "methods": ["DELETE"]},
+    {"name": "rename_registry_value", "methods": ["POST"]},
+    {"name": "modify_registry_value", "methods": ["POST"]},
 ]
 
 CONFIG_MGMT_CMDS = (
@@ -450,4 +532,78 @@ CONFIG_MGMT_CMDS = (
     "meshuser",
     "meshtoken",
     "meshdomain",
+    "certfile",
+    "keyfile",
 )
+
+ALL_TIMEZONES = sorted(zoneinfo.available_timezones())
+
+
+class TerminalShellChoices(models.TextChoices):
+    CMD = "cmd", "cmd"
+    POWERSHELL = "powershell", "powershell"
+    BASH = "bash", "bash"
+    CUSTOM = "custom", "custom"
+
+
+class WindowsTerminalShellChoices(models.TextChoices):
+    CMD = TerminalShellChoices.CMD, "cmd"
+    POWERSHELL = TerminalShellChoices.POWERSHELL, "powershell"
+    CUSTOM = TerminalShellChoices.CUSTOM, "custom"
+
+
+class LinuxTerminalShellChoices(models.TextChoices):
+    BASH = TerminalShellChoices.BASH, "bash"
+    CUSTOM = TerminalShellChoices.CUSTOM, "custom"
+
+
+class DarwinTerminalShellChoices(models.TextChoices):
+    BASH = TerminalShellChoices.BASH, "bash"
+    CUSTOM = TerminalShellChoices.CUSTOM, "custom"
+
+
+WINDOWS_TOKENS = {
+    TerminalShellChoices.CMD,
+    TerminalShellChoices.POWERSHELL,
+}
+
+LINUX_TOKENS = {
+    TerminalShellChoices.BASH,
+}
+
+DARWIN_TOKENS = {
+    TerminalShellChoices.BASH,
+}
+
+
+class AgentTerminalShellChoices(models.TextChoices):
+    USE_GLOBAL = "use_global", "Use global default"
+    CMD = "cmd", "cmd"
+    POWERSHELL = "powershell", "powershell"
+    BASH = "bash", "bash"
+    CUSTOM = "custom", "custom"
+
+
+AGENT_WINDOWS_SHELL_TOKENS = {
+    AgentTerminalShellChoices.USE_GLOBAL,
+    AgentTerminalShellChoices.CMD,
+    AgentTerminalShellChoices.POWERSHELL,
+    AgentTerminalShellChoices.CUSTOM,
+}
+
+AGENT_LINUX_SHELL_TOKENS = {
+    AgentTerminalShellChoices.USE_GLOBAL,
+    AgentTerminalShellChoices.BASH,
+    AgentTerminalShellChoices.CUSTOM,
+}
+
+AGENT_DARWIN_SHELL_TOKENS = {
+    AgentTerminalShellChoices.USE_GLOBAL,
+    AgentTerminalShellChoices.BASH,
+    AgentTerminalShellChoices.CUSTOM,
+}
+
+
+class TerminalModeChoices(models.TextChoices):
+    NEW = "new", "Use new terminal"
+    LEGACY = "legacy", "Use legacy terminal"

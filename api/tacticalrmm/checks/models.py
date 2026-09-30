@@ -19,6 +19,7 @@ from tacticalrmm.constants import (
     EvtLogNames,
     EvtLogTypes,
 )
+from tacticalrmm.helpers import has_script_actions, has_webhook
 from tacticalrmm.models import PermissionQuerySet
 
 if TYPE_CHECKING:
@@ -105,13 +106,19 @@ class Check(BaseAuditModel):
         default=list,
     )
     info_return_codes = ArrayField(
-        models.PositiveIntegerField(),
+        models.BigIntegerField(),
         null=True,
         blank=True,
         default=list,
     )
     warning_return_codes = ArrayField(
-        models.PositiveIntegerField(),
+        models.BigIntegerField(),
+        null=True,
+        blank=True,
+        default=list,
+    )
+    success_return_codes = ArrayField(
+        models.PositiveBigIntegerField(),
         null=True,
         blank=True,
         default=list,
@@ -154,7 +161,7 @@ class Check(BaseAuditModel):
 
     def __str__(self):
         if self.agent:
-            return f"{self.agent.hostname} - {self.readable_desc}"
+            return f"{self.readable_desc}"
 
         return f"{self.policy.name} - {self.readable_desc}"
 
@@ -168,10 +175,7 @@ class Check(BaseAuditModel):
         elif self.agent:
             cache.delete(f"agent_{self.agent.agent_id}_checks")
 
-        super(Check, self).save(
-            *args,
-            **kwargs,
-        )
+        super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
         # if check is a policy check clear cache on everything
@@ -183,10 +187,7 @@ class Check(BaseAuditModel):
         elif self.agent:
             cache.delete(f"agent_{self.agent.agent_id}_checks")
 
-        super(Check, self).delete(
-            *args,
-            **kwargs,
-        )
+        super().delete(*args, **kwargs)
 
     @property
     def readable_desc(self):
@@ -236,18 +237,19 @@ class Check(BaseAuditModel):
         check.save()
 
     def should_create_alert(self, alert_template=None):
+        has_check_notifications = (
+            self.dashboard_alert or self.email_alert or self.text_alert
+        )
+        has_alert_template_notification = alert_template and (
+            alert_template.check_always_alert
+            or alert_template.check_always_email
+            or alert_template.check_always_text
+        )
         return (
-            self.dashboard_alert
-            or self.email_alert
-            or self.text_alert
-            or (
-                alert_template
-                and (
-                    alert_template.check_always_alert
-                    or alert_template.check_always_email
-                    or alert_template.check_always_text
-                )
-            )
+            has_check_notifications
+            or has_alert_template_notification
+            or has_webhook(alert_template, "check")
+            or has_script_actions(alert_template, "check")
         )
 
     def add_check_history(
@@ -290,6 +292,7 @@ class CheckResult(models.Model):
     class Meta:
         unique_together = (("agent", "assigned_check"),)
 
+    id = models.BigAutoField(primary_key=True)
     agent = models.ForeignKey(
         "agents.Agent",
         related_name="checkresults",
@@ -326,7 +329,7 @@ class CheckResult(models.Model):
     )
 
     def __str__(self):
-        return f"{self.agent.hostname} - {self.assigned_check}"
+        return f"{self.assigned_check}"
 
     def save(self, *args, **kwargs):
         # if check is a policy check clear cache on everything
@@ -338,10 +341,7 @@ class CheckResult(models.Model):
         ):
             self.alert_severity = AlertSeverity.WARNING
 
-        super(CheckResult, self).save(
-            *args,
-            **kwargs,
-        )
+        super().save(*args, **kwargs)
 
     @property
     def history_info(self):
@@ -371,9 +371,11 @@ class CheckResult(models.Model):
             if len(self.history) > 15:
                 self.history = self.history[-15:]
 
-            update_fields.extend(["history"])
+            update_fields.extend(["history", "more_info"])
 
             avg = int(mean(self.history))
+            txt = "Memory Usage" if check.check_type == CheckType.MEMORY else "CPU Load"
+            self.more_info = f"Average {txt}: {avg}%"
 
             if check.error_threshold and avg > check.error_threshold:
                 self.status = CheckStatus.FAILING
@@ -431,6 +433,8 @@ class CheckResult(models.Model):
             elif data["retcode"] in check.warning_return_codes:
                 self.alert_severity = AlertSeverity.WARNING
                 self.status = CheckStatus.FAILING
+            elif data["retcode"] in check.success_return_codes:
+                self.status = CheckStatus.PASSING
             elif data["retcode"] != 0:
                 self.status = CheckStatus.FAILING
                 self.alert_severity = AlertSeverity.ERROR
@@ -610,7 +614,7 @@ class CheckResult(models.Model):
         body: str = ""
 
         if self.agent:
-            subject = f"{self.agent.client.name}, {self.agent.site.name}, {self} Failed"
+            subject = f"{self.agent.client.name}, {self.agent.site.name}, {self.agent.hostname} - {self} Failed"
         else:
             subject = f"{self} Failed"
 
@@ -658,21 +662,22 @@ class CheckResult(models.Model):
     def send_resolved_email(self):
         CORE = get_core_settings()
 
-        subject = f"{self.agent.client.name}, {self.agent.site.name}, {self} Resolved"
-        body = f"{self} is now back to normal"
+        subject = f"{self.agent.client.name}, {self.agent.site.name}, {self.agent.hostname} - {self} Resolved"
+        body = f"{self.agent.client.name}, {self.agent.site.name}, {self.agent.hostname} - {self} is now back to normal"
 
         CORE.send_mail(subject, body, alert_template=self.agent.alert_template)
 
     def send_resolved_sms(self):
         CORE = get_core_settings()
 
-        subject = f"{self.agent.client.name}, {self.agent.site.name}, {self} Resolved"
+        subject = f"{self.agent.client.name}, {self.agent.site.name}, {self.agent.hostname} - {self} Resolved"
         CORE.send_sms(subject, alert_template=self.agent.alert_template)
 
 
 class CheckHistory(models.Model):
     objects = PermissionQuerySet.as_manager()
 
+    id = models.BigAutoField(primary_key=True)
     check_id = models.PositiveIntegerField(default=0)
     agent_id = models.CharField(max_length=200, null=True, blank=True)
     x = models.DateTimeField(auto_now_add=True)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-SCRIPT_VERSION="148"
+SCRIPT_VERSION="161"
 SCRIPT_URL='https://raw.githubusercontent.com/amidaware/tacticalrmm/master/update.sh'
 LATEST_SETTINGS_URL='https://raw.githubusercontent.com/amidaware/tacticalrmm/master/api/tacticalrmm/tacticalrmm/settings.py'
 YELLOW='\033[1;33m'
@@ -10,8 +10,9 @@ NC='\033[0m'
 THIS_SCRIPT=$(readlink -f "$0")
 
 SCRIPTS_DIR='/opt/trmm-community-scripts'
-PYTHON_VER='3.11.4'
+PYTHON_VER='3.12.13'
 SETTINGS_FILE='/rmm/api/tacticalrmm/tacticalrmm/settings.py'
+local_settings='/rmm/api/tacticalrmm/tacticalrmm/local_settings.py'
 
 TMP_FILE=$(mktemp -p "" "rmmupdate_XXXXXXXXXX")
 curl -s -L "${SCRIPT_URL}" >${TMP_FILE}
@@ -19,11 +20,13 @@ NEW_VER=$(grep "^SCRIPT_VERSION" "$TMP_FILE" | awk -F'[="]' '{print $3}')
 
 if [ "${SCRIPT_VERSION}" -ne "${NEW_VER}" ]; then
   printf >&2 "${YELLOW}Old update script detected, downloading and replacing with the latest version...${NC}\n"
-  wget -q "${SCRIPT_URL}" -O update.sh
+  wget -q "${SCRIPT_URL}" -O "${THIS_SCRIPT}"
   exec ${THIS_SCRIPT}
 fi
 
 rm -f $TMP_FILE
+
+export DEBIAN_FRONTEND=noninteractive
 
 force=false
 if [[ $* == *--force* ]]; then
@@ -102,28 +105,6 @@ EOF
   sudo systemctl daemon-reload
 fi
 
-rmmconf='/etc/nginx/sites-available/rmm.conf'
-CHECK_NATS_WEBSOCKET=$(grep natsws $rmmconf)
-if ! [[ $CHECK_NATS_WEBSOCKET ]]; then
-  echo "Adding nats websocket to nginx config"
-  echo "$(awk '
-  /location \/ {/ {
-      print "    location ~ ^/natsws {"
-      print "        proxy_pass http://127.0.0.1:9235;"
-      print "        proxy_http_version 1.1;"
-      print "        proxy_set_header Host $host;"
-      print "        proxy_set_header Upgrade $http_upgrade;"
-      print "        proxy_set_header Connection \"upgrade\";"
-      print "        proxy_set_header X-Forwarded-Host $host:$server_port;"
-      print "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;"
-      print "        proxy_set_header X-Forwarded-Proto $scheme;"
-      print "    }"
-      print "\n"
-  }
-  { print }
-  ' $rmmconf)" | sudo tee $rmmconf >/dev/null
-fi
-
 printf >&2 "${GREEN}Stopping celery and celerybeat services (this might take a while)...${NC}\n"
 for i in celerybeat celery; do
   sudo systemctl stop ${i}
@@ -134,15 +115,43 @@ for i in nginx nats-api nats rmm daphne; do
   sudo systemctl stop ${i}
 done
 
-CHECK_DAPHNE=$(grep v2 /etc/systemd/system/daphne.service)
-if ! [[ $CHECK_DAPHNE ]]; then
+if ! grep -q V4 /etc/systemd/system/celerybeat.service; then
+  sudo rm -f /etc/systemd/system/celerybeat.service
 
-  sudo rm -f /etc/systemd/system/daphne.service
-
-  daphneservice="$(
+  celerybeatservice="$(
     cat <<EOF
 [Unit]
-Description=django channels daemon v2
+Description=Celery Beat Service V4
+After=network.target redis-server.service postgresql.service
+
+[Service]
+Type=simple
+User=${USER}
+Group=${USER}
+EnvironmentFile=/etc/conf.d/celery.conf
+WorkingDirectory=/rmm/api/tacticalrmm
+ExecStart=/bin/sh -c '\${CELERY_BIN} -A \${CELERY_APP} beat --pidfile=\${CELERYBEAT_PID_FILE} --logfile=\${CELERYBEAT_LOG_FILE} --loglevel=\${CELERYD_LOG_LEVEL}'
+ExecStartPre=rm -f /rmm/api/tacticalrmm/beat.pid
+ExecStartPre=rm -f /rmm/api/tacticalrmm/celerybeat-schedule
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  )"
+  echo "${celerybeatservice}" | sudo tee /etc/systemd/system/celerybeat.service >/dev/null
+  sudo systemctl daemon-reload
+fi
+
+# migrate daphne to uvicorn
+if ! grep -q uvicorn /etc/systemd/system/daphne.service; then
+  sudo rm -f /etc/systemd/system/daphne.service
+
+  uviservice="$(
+    cat <<EOF
+[Unit]
+Description=uvicorn daemon v1
 After=network.target
 
 [Service]
@@ -150,7 +159,7 @@ User=${USER}
 Group=www-data
 WorkingDirectory=/rmm/api/tacticalrmm
 Environment="PATH=/rmm/api/env/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ExecStart=/rmm/api/env/bin/daphne -u /rmm/daphne.sock tacticalrmm.asgi:application
+ExecStart=/rmm/api/env/bin/uvicorn --uds /rmm/daphne.sock --forwarded-allow-ips='*' tacticalrmm.asgi:application
 ExecStartPre=rm -f /rmm/daphne.sock
 ExecStartPre=rm -f /rmm/daphne.sock.lock
 Restart=always
@@ -160,24 +169,75 @@ RestartSec=3s
 WantedBy=multi-user.target
 EOF
   )"
-  echo "${daphneservice}" | sudo tee /etc/systemd/system/daphne.service >/dev/null
+  echo "${uviservice}" | sudo tee /etc/systemd/system/daphne.service >/dev/null
   sudo systemctl daemon-reload
 fi
 
-if [ ! -f /etc/apt/sources.list.d/nginx.list ]; then
-  osname=$(lsb_release -si)
-  osname=${osname^}
-  osname=$(echo "$osname" | tr '[A-Z]' '[a-z]')
-  codename=$(lsb_release -sc)
+osname=$(lsb_release -si)
+osname=${osname^}
+osname=$(echo "$osname" | tr '[A-Z]' '[a-z]')
+
+if [[ "$osname" == "debian" && "$(lsb_release -sr | cut -d. -f1)" -eq 11 ]]; then
+  printf >&2 "${YELLOW}WARNING: Debian 11 is end-of-life. Please plan a backup/restore to Debian 13 or Ubuntu 26.04.${NC}\n"
+  printf >&2 "${YELLOW}https://docs.tacticalrmm.com/backup${NC}\n"
+  printf >&2 "${YELLOW}https://docs.tacticalrmm.com/restore${NC}\n"
+fi
+
+# for weasyprint
+if [[ "$osname" == "debian" ]]; then
+  count=$(dpkg -l | grep -E "libpango-1.0-0|libpangoft2-1.0-0" | wc -l)
+  if ! [ "$count" -eq 2 ]; then
+    sudo apt install -y libpango-1.0-0 libpangoft2-1.0-0
+  fi
+elif [[ "$osname" == "ubuntu" ]]; then
+  count=$(dpkg -l | grep -E "libpango-1.0-0|libharfbuzz0b|libpangoft2-1.0-0" | wc -l)
+  if ! [ "$count" -eq 3 ]; then
+    sudo apt install -y libpango-1.0-0 libharfbuzz0b libpangoft2-1.0-0
+  fi
+fi
+
+codename=$(lsb_release -sc)
+
+# refresh an armored key in place. only replaces the existing file if the download is valid
+refresh_asc_key() {
+  local tmpkey
+  tmpkey=$(mktemp)
+  if curl -fsSL "$1" >"$tmpkey" && grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$tmpkey"; then
+    sudo install -m 644 "$tmpkey" "$2"
+  else
+    printf >&2 "${YELLOW}Warning: could not refresh $2 from $1, keeping existing key${NC}\n"
+  fi
+  rm -f "$tmpkey"
+}
+
+if [ -f /etc/apt/sources.list.d/nginx.sources ]; then
+  # deb822 layout (Debian 13 / Ubuntu 26.04 installs): keep the armored key fresh
+  refresh_asc_key https://nginx.org/keys/nginx_signing.key /etc/apt/keyrings/nginx.asc
+
+  if [ -f /etc/apt/sources.list.d/nodesource.sources ] && [ -f /etc/apt/keyrings/nodesource.asc ]; then
+    refresh_asc_key https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key /etc/apt/keyrings/nodesource.asc
+  fi
+elif [ ! -f /etc/apt/sources.list.d/nginx.list ]; then
+  # legacy layout, repo missing entirely
   nginxrepo="$(
     cat <<EOF
 deb [signed-by=/etc/apt/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/$osname $codename nginx
 EOF
   )"
   echo "${nginxrepo}" | sudo tee /etc/apt/sources.list.d/nginx.list >/dev/null
-  wget -qO - https://nginx.org/packages/keys/nginx_signing.key | sudo gpg --dearmor -o /etc/apt/keyrings/nginx-archive-keyring.gpg
+  wget -qO - https://nginx.org/keys/nginx_signing.key | sudo gpg --dearmor -o /etc/apt/keyrings/nginx-archive-keyring.gpg
   sudo apt update
   sudo apt install -y nginx
+fi
+
+# legacy layout: only refresh when the dearmored key has actually expired (deb822 installs are refreshed above)
+if [ -f /etc/apt/keyrings/nginx-archive-keyring.gpg ]; then
+  NGINX_KEY_EXPIRED=$(gpg --dry-run --quiet --no-keyring --import --import-options import-show /etc/apt/keyrings/nginx-archive-keyring.gpg | grep -B 1 573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62 | grep expired)
+  if [[ $NGINX_KEY_EXPIRED ]]; then
+    sudo rm -f /etc/apt/keyrings/nginx-archive-keyring.gpg
+    wget -qO - https://nginx.org/keys/nginx_signing.key | sudo gpg --dearmor -o /etc/apt/keyrings/nginx-archive-keyring.gpg
+    sudo apt update
+  fi
 fi
 
 nginxdefaultconf='/etc/nginx/nginx.conf'
@@ -195,14 +255,42 @@ if ! [[ $CHECK_NGINX_NOLIMIT ]]; then
 /' $nginxdefaultconf
 fi
 
-backend_conf='/etc/nginx/sites-available/rmm.conf'
-CHECK_NGINX_REUSEPORT=$(grep reuseport $backend_conf)
-if ! [[ $CHECK_NGINX_REUSEPORT ]]; then
-  printf >&2 "${GREEN}Setting nginx reuseport${NC}\n"
-  sudo sed -i 's/listen 443 ssl;/listen 443 ssl reuseport;/g' $backend_conf
-fi
+sudo sed -i 's/# server_names_hash_bucket_size.*/server_names_hash_bucket_size 256;/g' $nginxdefaultconf
 
-sudo sed -i 's/# server_names_hash_bucket_size.*/server_names_hash_bucket_size 64;/g' $nginxdefaultconf
+CHECK_NGINX_SITESENABLED=$(grep "sites-enabled" $nginxdefaultconf)
+if ! [[ $CHECK_NGINX_SITESENABLED ]]; then
+  printf >&2 "${GREEN}Fixing nginx config${NC}\n"
+  nginxconf="$(
+    cat <<EOF
+worker_rlimit_nofile 1000000;
+user www-data;
+worker_processes auto;
+pid /run/nginx.pid;
+include /etc/nginx/modules-enabled/*.conf;
+
+events {
+        worker_connections 4096;
+}
+
+http {
+        sendfile on;
+        tcp_nopush on;
+        types_hash_max_size 2048;
+        server_names_hash_bucket_size 256;
+        include /etc/nginx/mime.types;
+        default_type application/octet-stream;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_prefer_server_ciphers on;
+        access_log /var/log/nginx/access.log;
+        error_log /var/log/nginx/error.log;
+        gzip on;
+        include /etc/nginx/conf.d/*.conf;
+        include /etc/nginx/sites-enabled/*;
+}
+EOF
+  )"
+  echo "${nginxconf}" | sudo tee $nginxdefaultconf >/dev/null
+fi
 
 if ! sudo nginx -t >/dev/null 2>&1; then
   sudo nginx -t
@@ -212,10 +300,10 @@ if ! sudo nginx -t >/dev/null 2>&1; then
   exit 1
 fi
 
-HAS_PY311=$(python3.11 --version | grep ${PYTHON_VER})
-if ! [[ $HAS_PY311 ]]; then
+HAS_PY312=$(python3.12 --version | grep ${PYTHON_VER})
+if ! [[ $HAS_PY312 ]]; then
   printf >&2 "${GREEN}Updating to ${PYTHON_VER}${NC}\n"
-  sudo apt install -y build-essential zlib1g-dev libncurses5-dev libgdbm-dev libnss3-dev libssl-dev libreadline-dev libffi-dev libsqlite3-dev libbz2-dev
+  sudo apt install -y build-essential zlib1g-dev libncurses-dev libgdbm-dev libnss3-dev libssl-dev libreadline-dev libffi-dev libsqlite3-dev libbz2-dev
   numprocs=$(nproc)
   cd ~
   wget https://www.python.org/ftp/python/${PYTHON_VER}/Python-${PYTHON_VER}.tgz
@@ -258,10 +346,152 @@ if [ -d ~/.cache ]; then
 fi
 
 if [ -d ~/.config ]; then
-  sudo chown -R $USER:$GROUP ~/.config
+  sudo chown -R $USER:$USER ~/.config
+fi
+
+NODE_MAJOR=24
+
+reinstall_nodejs() {
+  printf >&2 "${YELLOW}Node.js/npm is missing or broken, reinstalling from NodeSource${NC}\n"
+  sudo systemctl stop meshcentral
+
+  sudo apt remove -y nodejs npm
+  sudo rm -rf /usr/lib/node_modules
+  sudo rm -f /etc/apt/sources.list.d/nodesource.list /etc/apt/sources.list.d/nodesource.sources
+  sudo rm -f /etc/apt/keyrings/nodesource.gpg /etc/apt/keyrings/nodesource.asc /usr/share/keyrings/nodesource.gpg
+  sudo mkdir -p /etc/apt/keyrings
+
+  local relno fullrelno
+  relno=$(lsb_release -sr | cut -d. -f1)
+  fullrelno=$(lsb_release -sr)
+
+  if [[ "$osname" == "debian" && "$relno" -ge 13 ]] || [[ "$osname" == "ubuntu" && "$fullrelno" == "26.04" ]]; then
+    nodekey='/etc/apt/keyrings/nodesource.asc'
+    if ! curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | sudo tee "$nodekey" >/dev/null ||
+      ! grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$nodekey"; then
+      printf >&2 "${RED}ERROR: failed to download the NodeSource signing key${NC}\n"
+      exit 1
+    fi
+  else
+    # older apt can't read armored keys in Signed-By, so dearmor
+    nodekey='/etc/apt/keyrings/nodesource.gpg'
+    if ! command -v gpg >/dev/null; then
+      sudo apt install -y gnupg
+    fi
+    if ! curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | sudo gpg --dearmor --yes -o "$nodekey"; then
+      printf >&2 "${RED}ERROR: failed to download the NodeSource signing key${NC}\n"
+      exit 1
+    fi
+  fi
+  sudo chmod 644 "$nodekey"
+
+  noderepo="$(
+    cat <<EOF
+Types: deb
+URIs: https://deb.nodesource.com/node_${NODE_MAJOR}.x
+Suites: nodistro
+Components: main
+Signed-By: ${nodekey}
+EOF
+  )"
+  echo "${noderepo}" | sudo tee /etc/apt/sources.list.d/nodesource.sources >/dev/null
+
+  sudo apt update
+  sudo apt install -y nodejs
+  sudo npm install -g npm
+
+  sudo chown ${USER}:${USER} -R /meshcentral
+  cd /meshcentral
+  rm -rf node_modules/ package-lock.json
+  npm install
+  sudo systemctl start nginx
+  sleep 1
+  sudo systemctl start meshcentral
+}
+
+if ! command -v npm >/dev/null || ! node -v >/dev/null 2>&1; then
+  reinstall_nodejs
 fi
 
 sudo npm install -g npm
+
+# disable compression if set to fix some mesh issues
+mesh_cfg='/meshcentral/meshcentral-data/config.json'
+
+check_jq_filter='
+( .settings // {} ) |
+to_entries |
+map(
+    select((.key | ascii_downcase) | IN("compression", "wscompression", "agentwscompression"))
+) |
+all(.value == false)
+'
+
+apply_jq_filter='
+.settings |= (
+    with_entries(
+        if ((.key | ascii_downcase) | IN("compression", "wscompression", "agentwscompression")) then
+            .value = false
+        else
+            .
+        end
+    )
+)
+'
+
+if ! command -v jq >/dev/null; then
+  echo "installing jq"
+  sudo apt-get install -y jq >/dev/null
+fi
+
+if command -v jq >/dev/null; then
+  if ! jq -e "$check_jq_filter" "$mesh_cfg" >/dev/null; then
+    echo "Disabling mesh compression"
+    # backup to homedir first
+    cp "$mesh_cfg" ~/meshcfg-$(date "+%Y%m%dT%H%M%S").bak
+    mesh_tmp=$(mktemp)
+    if jq "$apply_jq_filter" "$mesh_cfg" >"$mesh_tmp"; then
+      if [ -s "$mesh_tmp" ]; then
+        mv "$mesh_tmp" "$mesh_cfg"
+      fi
+    fi
+    rm -f "$mesh_tmp"
+  fi
+fi
+
+if command -v jq >/dev/null; then
+  cp "$mesh_cfg" ~/meshcfg${CURRENT_TRMM_VER}-$(date "+%Y%m%dT%H%M%S").bak
+  mesh_tmp2=$(mktemp)
+  if jq '.settings.autoBackup = false' "$mesh_cfg" >"$mesh_tmp2" && [ -s "$mesh_tmp2" ]; then
+    mv "$mesh_tmp2" "$mesh_cfg"
+  fi
+fi
+
+CURRENT_MESH_VER=$(cd /meshcentral/node_modules/meshcentral && node -p -e "require('./package.json').version")
+if [[ "${CURRENT_MESH_VER}" != "${LATEST_MESH_VER}" ]] || [[ "$force" = true ]]; then
+  printf >&2 "${GREEN}Updating meshcentral from ${CURRENT_MESH_VER} to ${LATEST_MESH_VER}${NC}\n"
+  sudo systemctl stop meshcentral
+  sudo chown ${USER}:${USER} -R /meshcentral
+  cd /meshcentral
+  rm -rf node_modules/ package.json package-lock.json
+  mesh_pkg="$(
+    cat <<EOF
+{
+  "dependencies": {
+    "archiver": "7.0.1",
+    "meshcentral": "${LATEST_MESH_VER}",
+    "otplib": "13.4.1",
+    "pg": "8.16.3"
+  }
+}
+EOF
+  )"
+  echo "${mesh_pkg}" >/meshcentral/package.json
+  npm install
+  sudo systemctl start nginx
+  sleep 1
+  sudo systemctl start meshcentral
+fi
 
 # update from main repo
 cd /rmm
@@ -310,14 +540,14 @@ if ! [[ $CHECK_CELERY_CONFIG ]]; then
   sed -i 's/CELERYD_OPTS=.*/CELERYD_OPTS="--time-limit=86400 --autoscale=20,2"/g' /etc/conf.d/celery.conf
 fi
 
-CHECK_ADMIN_ENABLED=$(grep ADMIN_ENABLED /rmm/api/tacticalrmm/tacticalrmm/local_settings.py)
+CHECK_ADMIN_ENABLED=$(grep ADMIN_ENABLED $local_settings)
 if ! [[ $CHECK_ADMIN_ENABLED ]]; then
   adminenabled="$(
     cat <<EOF
 ADMIN_ENABLED = False
 EOF
   )"
-  echo "${adminenabled}" | tee --append /rmm/api/tacticalrmm/tacticalrmm/local_settings.py >/dev/null
+  echo "${adminenabled}" | tee --append $local_settings >/dev/null
 fi
 
 if [ "$arch" = "x86_64" ]; then
@@ -334,10 +564,10 @@ sudo chmod +x $nats_api
 if [[ "${CURRENT_PIP_VER}" != "${LATEST_PIP_VER}" ]] || [[ "$force" = true ]]; then
   rm -rf /rmm/api/env
   cd /rmm/api
-  python3.11 -m venv env
+  python3.12 -m venv env
   source /rmm/api/env/bin/activate
   cd /rmm/api/tacticalrmm
-  pip install --no-cache-dir --upgrade pip
+  pip install --no-cache-dir pip==25.1
   pip install --no-cache-dir setuptools==${SETUPTOOLS_VER} wheel==${WHEEL_VER}
   pip install --no-cache-dir -r requirements.txt
 else
@@ -346,9 +576,23 @@ else
   pip install -r requirements.txt
 fi
 
+if [ ! -d /opt/tactical/reporting/assets ]; then
+  sudo mkdir -p /opt/tactical/reporting/assets
+fi
+
+if [ ! -d /opt/tactical/reporting/schemas ]; then
+  sudo mkdir /opt/tactical/reporting/schemas
+fi
+
+sed -i '/^REDIS_HOST/d' $local_settings
+
+sudo chown -R ${USER}:${USER} /opt/tactical
+
 python manage.py pre_update_tasks
 celery -A tacticalrmm purge -f
+printf >&2 "${GREEN}Running database migrations (this might take a long time)...${NC}\n"
 python manage.py migrate
+python manage.py generate_json_schemas
 python manage.py delete_tokens
 python manage.py collectstatic --no-input
 python manage.py reload_nats
@@ -358,10 +602,14 @@ python manage.py create_natsapi_conf
 python manage.py create_uwsgi_conf
 python manage.py clear_redis_celery_locks
 python manage.py post_update_tasks
+echo "Running management commands...please wait..."
 API=$(python manage.py get_config api)
 WEB_VERSION=$(python manage.py get_config webversion)
 FRONTEND=$(python manage.py get_config webdomain)
 MESHDOMAIN=$(python manage.py get_config meshdomain)
+WEBTAR_URL=$(python manage.py get_webtar_url)
+CERT_PUB_KEY=$(python manage.py get_config certfile)
+CERT_PRIV_KEY=$(python manage.py get_config keyfile)
 deactivate
 
 if grep -q manage_etc_hosts /etc/hosts; then
@@ -371,6 +619,15 @@ if grep -q manage_etc_hosts /etc/hosts; then
     sudo systemctl restart cloud-init >/dev/null
   fi
 fi
+
+for i in rmm frontend meshcentral; do
+  conf="/etc/nginx/sites-enabled/${i}.conf"
+  if grep -q "ssl_stapling" "$conf"; then
+    # backup to homedir first
+    cp "$conf" ~/${i}.nginx.bak.v1.2.0
+    sudo sed -i '/ssl_stapling/d' "$conf"
+  fi
+done
 
 CHECK_HOSTS=$(grep 127.0.1.1 /etc/hosts | grep "$API" | grep "$FRONTEND" | grep "$MESHDOMAIN")
 HAS_11=$(grep 127.0.1.1 /etc/hosts)
@@ -392,7 +649,7 @@ if [ ! -d /var/www/rmm ]; then
 fi
 
 webtar="trmm-web-v${WEB_VERSION}.tar.gz"
-wget -q https://github.com/amidaware/tacticalrmm-web/releases/download/v${WEB_VERSION}/${webtar} -O /tmp/${webtar}
+wget -q ${WEBTAR_URL} -O /tmp/${webtar}
 sudo rm -rf /var/www/rmm/dist
 sudo tar -xzf /tmp/${webtar} -C /var/www/rmm
 echo "window._env_ = {PROD_URL: \"https://${API}\"}" | sudo tee /var/www/rmm/dist/env-config.js >/dev/null
@@ -404,30 +661,6 @@ for i in nats nats-api rmm daphne celery celerybeat nginx; do
   sudo systemctl start ${i}
 done
 
-CURRENT_MESH_VER=$(cd /meshcentral/node_modules/meshcentral && node -p -e "require('./package.json').version")
-if [[ "${CURRENT_MESH_VER}" != "${LATEST_MESH_VER}" ]] || [[ "$force" = true ]]; then
-  printf >&2 "${GREEN}Updating meshcentral from ${CURRENT_MESH_VER} to ${LATEST_MESH_VER}${NC}\n"
-  sudo systemctl stop meshcentral
-  sudo chown ${USER}:${USER} -R /meshcentral
-  cd /meshcentral
-  rm -rf node_modules/ package.json package-lock.json
-  mesh_pkg="$(
-    cat <<EOF
-{
-  "dependencies": {
-    "archiver": "5.3.1",
-    "meshcentral": "${LATEST_MESH_VER}",
-    "otplib": "10.2.3",
-    "pg": "8.7.1",
-    "pgtools": "0.3.2"
-  }
-}
-EOF
-  )"
-  echo "${mesh_pkg}" >/meshcentral/package.json
-  npm install
-  sudo systemctl start meshcentral
-fi
-
 rm -f $TMP_SETTINGS
+sudo systemctl reload nginx
 printf >&2 "${GREEN}Update finished!${NC}\n"

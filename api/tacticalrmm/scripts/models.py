@@ -9,7 +9,7 @@ from django.db.models.fields import CharField, TextField
 
 from logs.models import BaseAuditModel
 from tacticalrmm.constants import ScriptShell, ScriptType
-from tacticalrmm.utils import replace_db_values
+from tacticalrmm.utils import replace_arg_db_values
 
 
 class Script(BaseAuditModel):
@@ -69,12 +69,9 @@ class Script(BaseAuditModel):
                 snippet_name = snippet.group(1).strip()
                 if ScriptSnippet.objects.filter(name=snippet_name).exists():
                     value = ScriptSnippet.objects.get(name=snippet_name).code
-                else:
-                    value = ""
-
-                replaced_code = re.sub(
-                    snippet.group(), value.replace("\\", "\\\\"), replaced_code
-                )
+                    replaced_code = re.sub(
+                        snippet.group(), value.replace("\\", "\\\\"), replaced_code
+                    )
             return replaced_code
 
         return code
@@ -121,7 +118,13 @@ class Script(BaseAuditModel):
 
                 args = script["args"] if "args" in script.keys() else []
 
+                env = script["env"] if "env" in script.keys() else []
+
                 syntax = script["syntax"] if "syntax" in script.keys() else ""
+
+                run_as_user = (
+                    script["run_as_user"] if "run_as_user" in script.keys() else False
+                )
 
                 supported_platforms = (
                     script["supported_platforms"]
@@ -138,7 +141,9 @@ class Script(BaseAuditModel):
                     i.shell = script["shell"]
                     i.default_timeout = default_timeout
                     i.args = args
+                    i.env_vars = env
                     i.syntax = syntax
+                    i.run_as_user = run_as_user
                     i.filename = script["filename"]
                     i.supported_platforms = supported_platforms
 
@@ -166,8 +171,10 @@ class Script(BaseAuditModel):
                             category=category,
                             default_timeout=default_timeout,
                             args=args,
+                            env_vars=env,
                             filename=script["filename"],
                             syntax=syntax,
+                            run_as_user=run_as_user,
                             supported_platforms=supported_platforms,
                         )
                         # new_script.hash_script_body()  # also saves script
@@ -208,7 +215,7 @@ class Script(BaseAuditModel):
             if match := pattern.match(arg):
                 # only get the match between the () in regex
                 string = match.group(1)
-                value = replace_db_values(
+                value = replace_arg_db_values(
                     string=string,
                     instance=agent,
                     shell=shell,
@@ -248,7 +255,7 @@ class Script(BaseAuditModel):
                 continue
             if match := pattern.match(env_val):
                 string = match.group(1)
-                value = replace_db_values(
+                value = replace_arg_db_values(
                     string=string,
                     instance=agent,
                     shell=shell,

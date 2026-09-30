@@ -47,7 +47,7 @@ class Policy(BaseAuditModel):
         old_policy: Optional[Policy] = (
             type(self).objects.get(pk=self.pk) if self.pk else None
         )
-        super(Policy, self).save(old_model=old_policy, *args, **kwargs)
+        super().save(old_model=old_policy, *args, **kwargs)
 
         # check if alert template was changes and cache on agents
         if old_policy:
@@ -68,10 +68,7 @@ class Policy(BaseAuditModel):
         cache.delete_many_pattern("site_server_*")
         cache.delete_many_pattern("agent_*")
 
-        super(Policy, self).delete(
-            *args,
-            **kwargs,
-        )
+        super().delete(*args, **kwargs)
 
     def __str__(self) -> str:
         return self.name
@@ -178,6 +175,7 @@ class Policy(BaseAuditModel):
 
         filtered_agents_ids |= (
             Agent.objects.exclude(block_policy_inheritance=True)
+            .exclude(id__in=excluded_agents_ids)
             .filter(
                 site_id__in=[
                     site.id
@@ -194,6 +192,7 @@ class Policy(BaseAuditModel):
         filtered_agents_ids |= (
             Agent.objects.exclude(block_policy_inheritance=True)
             .exclude(site__block_policy_inheritance=True)
+            .exclude(id__in=excluded_agents_ids)
             .filter(
                 site__client__in=explicit_clients_qs,
                 **agent_filter,
@@ -228,7 +227,8 @@ class Policy(BaseAuditModel):
             if policy and policy.active and policy.pk not in processed_policies:
                 processed_policies.append(policy.pk)
                 for task in policy.autotasks.all():
-                    tasks.append(task)
+                    if agent.plat in task.task_supported_platforms:
+                        tasks.append(task)
 
         return tasks
 

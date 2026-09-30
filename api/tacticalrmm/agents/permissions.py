@@ -47,13 +47,6 @@ class UpdateAgentPerms(permissions.BasePermission):
         return _has_perm(r, "can_update_agents")
 
 
-class PingAgentPerms(permissions.BasePermission):
-    def has_permission(self, r, view) -> bool:
-        return _has_perm(r, "can_ping_agents") and _has_perm_on_agent(
-            r.user, view.kwargs["agent_id"]
-        )
-
-
 class ManageProcPerms(permissions.BasePermission):
     def has_permission(self, r, view) -> bool:
         return _has_perm(r, "can_manage_procs") and _has_perm_on_agent(
@@ -132,3 +125,23 @@ class AgentWOLPerms(permissions.BasePermission):
             )
 
         return _has_perm(r, "can_send_wol")
+
+
+class AgentRegistryPerms(permissions.BasePermission):
+    def has_permission(self, r, view) -> bool:
+        if "agent_id" in view.kwargs.keys():
+            return _has_perm(r, "can_use_registry") and _has_perm_on_agent(
+                r.user, view.kwargs["agent_id"]
+            )
+
+        return _has_perm(r, "can_use_registry")
+
+
+class AgentTerminalPerms(permissions.BasePermission):
+    def has_permission(self, r, view) -> bool:
+        if "agent_id" in view.kwargs.keys():
+            return _has_perm(r, "can_use_terminal") and _has_perm_on_agent(
+                r.user, view.kwargs["agent_id"]
+            )
+
+        return _has_perm(r, "can_use_terminal")

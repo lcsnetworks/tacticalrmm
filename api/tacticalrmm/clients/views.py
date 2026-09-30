@@ -92,7 +92,8 @@ class GetAddClients(APIView):
         if "initialsetup" in request.data.keys():
             core = get_core_settings()
             core.default_time_zone = request.data["timezone"]
-            core.save(update_fields=["default_time_zone"])
+            core.mesh_company_name = request.data["companyname"]
+            core.save(update_fields=["default_time_zone", "mesh_company_name"])
 
         # save custom fields
         if "custom_fields" in request.data.keys():
@@ -175,6 +176,9 @@ class GetUpdateDeleteClient(APIView):
         if agent_count > 0 and "move_to_site" in request.query_params.keys():
             agents = Agent.objects.filter(site__client=client)
             site = get_object_or_404(Site, pk=request.query_params["move_to_site"])
+            if not _has_perm_on_site(request.user, site.pk):
+                raise PermissionDenied()
+
             agents.update(site=site)
 
         elif agent_count > 0:
@@ -270,6 +274,9 @@ class GetUpdateDeleteSite(APIView):
         if agent_count > 0 and "move_to_site" in request.query_params.keys():
             agents = Agent.objects.filter(site=site)
             new_site = get_object_or_404(Site, pk=request.query_params["move_to_site"])
+            if not _has_perm_on_site(request.user, new_site.pk):
+                raise PermissionDenied()
+
             agents.update(site=new_site)
 
         elif agent_count > 0:

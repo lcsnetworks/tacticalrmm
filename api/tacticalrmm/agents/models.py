@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import random
 import re
 from collections import Counter
 from contextlib import suppress
@@ -7,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union, ca
 import msgpack
 import nats
 import validators
-from asgiref.sync import sync_to_async
+from channels.layers import get_channel_layer
 from django.conf import settings
 from django.contrib.postgres.fields import ArrayField
 from django.core.cache import cache
@@ -17,30 +19,37 @@ from nats.errors import TimeoutError
 from packaging import version as pyver
 from packaging.version import Version as LooseVersion
 
-from agents.utils import get_agent_url
-from checks.models import CheckResult
+from agents.utils import (
+    calculate_agent_checks,
+    get_agent_url,
+    is_posix_abs_path,
+    is_windows_path,
+    strip_relation_caches_for_cache,
+)
 from core.models import TZ_CHOICES
-from core.utils import get_core_settings, send_command_with_mesh
+from core.utils import _b64_to_hex, get_core_settings, send_command_with_mesh
 from logs.models import BaseAuditModel, DebugLog, PendingAction
 from tacticalrmm.constants import (
     AGENT_STATUS_OFFLINE,
     AGENT_STATUS_ONLINE,
     AGENT_STATUS_OVERDUE,
     AGENT_TBL_PEND_ACTION_CNT_CACHE_PREFIX,
+    DARWIN_TOKENS,
+    LINUX_TOKENS,
     ONLINE_AGENTS,
+    WINDOWS_TOKENS,
     AgentHistoryType,
     AgentMonType,
     AgentPlat,
-    AlertSeverity,
-    CheckStatus,
-    CheckType,
+    AgentTerminalShellChoices,
     CustomFieldType,
     DebugLogType,
     GoArch,
     PAAction,
     PAStatus,
+    TerminalShellChoices,
 )
-from tacticalrmm.helpers import setup_nats_options
+from tacticalrmm.helpers import has_script_actions, has_webhook, setup_nats_options
 from tacticalrmm.models import PermissionQuerySet
 
 if TYPE_CHECKING:
@@ -53,6 +62,8 @@ if TYPE_CHECKING:
 
 # type helpers
 Disk = Union[Dict[str, Any], str]
+
+logger = logging.getLogger("trmm")
 
 
 class Agent(BaseAuditModel):
@@ -121,8 +132,41 @@ class Agent(BaseAuditModel):
         on_delete=models.SET_NULL,
     )
 
+    default_shell = models.CharField(
+        max_length=32,
+        choices=AgentTerminalShellChoices.choices,
+        default=AgentTerminalShellChoices.USE_GLOBAL,
+    )
+
+    default_shell_custom = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
+    )
+
     def __str__(self) -> str:
         return self.hostname
+
+    def save(self, *args, **kwargs):
+        # prevent recursion since calling set_alert_template() also calls save()
+        if not hasattr(self, "_processing_set_alert_template"):
+            self._processing_set_alert_template = False
+
+        if self.pk and not self._processing_set_alert_template:
+            orig = Agent.objects.get(pk=self.pk)
+            mon_type_changed = self.monitoring_type != orig.monitoring_type
+            site_changed = self.site_id != orig.site_id
+            policy_changed = self.policy != orig.policy
+            block_inherit = (
+                self.block_policy_inheritance != orig.block_policy_inheritance
+            )
+
+            if mon_type_changed or site_changed or policy_changed or block_inherit:
+                self._processing_set_alert_template = True
+                self.set_alert_template()
+                self._processing_set_alert_template = False
+
+        super().save(*args, **kwargs)
 
     @property
     def client(self) -> "Client":
@@ -216,48 +260,85 @@ class Agent(BaseAuditModel):
             return AGENT_STATUS_OFFLINE
 
     @property
+    def effective_default_shell(self) -> str:
+        """
+        Final shell string used to launch the real-time terminal.
+
+        Windows:
+          - "cmd" | "powershell" | absolute Windows path
+
+        Linux/macOS:
+          - "bash" | absolute POSIX path
+        """
+
+        def clean(v) -> str:
+            return (v or "").strip()
+
+        if self.default_shell == AgentTerminalShellChoices.CUSTOM:
+            v = clean(self.default_shell_custom)
+            if self.plat == AgentPlat.WINDOWS:
+                return v if (v and is_windows_path(v)) else "cmd"
+            if self.plat in {AgentPlat.LINUX, AgentPlat.DARWIN}:
+                return v if (v and is_posix_abs_path(v)) else "bash"
+            return "cmd"
+
+        if (
+            self.default_shell
+            and self.default_shell != AgentTerminalShellChoices.USE_GLOBAL
+        ):
+            # token override only (cmd/powershell/bash)
+            shell = clean(self.default_shell).lower()
+            if self.plat == AgentPlat.WINDOWS:
+                return shell if shell in WINDOWS_TOKENS else "cmd"
+            if self.plat == AgentPlat.LINUX:
+                return shell if shell in LINUX_TOKENS else "bash"
+            if self.plat == AgentPlat.DARWIN:
+                return shell if shell in DARWIN_TOKENS else "bash"
+            return "cmd"
+
+        try:
+            core = get_core_settings()
+        except Exception:
+            core = None
+
+        if not core:
+            return "cmd" if self.plat == AgentPlat.WINDOWS else "bash"
+
+        if self.plat == AgentPlat.WINDOWS:
+            if core.default_shell_windows == TerminalShellChoices.CUSTOM:
+                v = clean(core.default_shell_windows_custom)
+                return v if (v and is_windows_path(v)) else "cmd"
+            shell = clean(core.default_shell_windows).lower()
+            return shell if shell in WINDOWS_TOKENS else "cmd"
+
+        if self.plat == AgentPlat.LINUX:
+            if core.default_shell_linux == TerminalShellChoices.CUSTOM:
+                v = clean(core.default_shell_linux_custom)
+                return v if (v and is_posix_abs_path(v)) else "bash"
+            shell = clean(core.default_shell_linux).lower()
+            return shell if shell in LINUX_TOKENS else "bash"
+
+        if self.plat == AgentPlat.DARWIN:
+            if core.default_shell_darwin == TerminalShellChoices.CUSTOM:
+                v = clean(core.default_shell_darwin_custom)
+                return v if (v and is_posix_abs_path(v)) else "bash"
+            shell = clean(core.default_shell_darwin).lower()
+            return shell if shell in DARWIN_TOKENS else "bash"
+
+        return "cmd"
+
+    @property
+    def resolved_default_shell(self):
+        effective_shell = (self.effective_default_shell or "").strip().lower()
+        builtin_shells = {"cmd", "powershell", "bash"}
+        if effective_shell in builtin_shells:
+            return effective_shell
+
+        return "custom"
+
+    @property
     def checks(self) -> Dict[str, Any]:
-        total, passing, failing, warning, info = 0, 0, 0, 0, 0
-
-        for check in self.get_checks_with_policies(exclude_overridden=True):
-            total += 1
-            if (
-                not hasattr(check.check_result, "status")
-                or isinstance(check.check_result, CheckResult)
-                and check.check_result.status == CheckStatus.PASSING
-            ):
-                passing += 1
-            elif (
-                isinstance(check.check_result, CheckResult)
-                and check.check_result.status == CheckStatus.FAILING
-            ):
-                alert_severity = (
-                    check.check_result.alert_severity
-                    if check.check_type
-                    in (
-                        CheckType.MEMORY,
-                        CheckType.CPU_LOAD,
-                        CheckType.DISK_SPACE,
-                        CheckType.SCRIPT,
-                    )
-                    else check.alert_severity
-                )
-                if alert_severity == AlertSeverity.ERROR:
-                    failing += 1
-                elif alert_severity == AlertSeverity.WARNING:
-                    warning += 1
-                elif alert_severity == AlertSeverity.INFO:
-                    info += 1
-
-        ret = {
-            "total": total,
-            "passing": passing,
-            "failing": failing,
-            "warning": warning,
-            "info": info,
-            "has_failing_checks": failing > 0 or warning > 0,
-        }
-        return ret
+        return calculate_agent_checks(self)
 
     @property
     def pending_actions_count(self) -> int:
@@ -280,7 +361,20 @@ class Agent(BaseAuditModel):
         try:
             cpus = self.wmi_detail["cpu"]
             for cpu in cpus:
-                ret.append([x["Name"] for x in cpu if "Name" in x][0])
+                name = [x["Name"] for x in cpu if "Name" in x][0]
+                lp, nc = "", ""
+                with suppress(Exception):
+                    lp = [
+                        x["NumberOfLogicalProcessors"]
+                        for x in cpu
+                        if "NumberOfCores" in x
+                    ][0]
+                    nc = [x["NumberOfCores"] for x in cpu if "NumberOfCores" in x][0]
+                if lp and nc:
+                    cpu_string = f"{name}, {nc}C/{lp}T"
+                else:
+                    cpu_string = name
+                ret.append(cpu_string)
             return ret
         except:
             return ["unknown cpu model"]
@@ -411,12 +505,22 @@ class Agent(BaseAuditModel):
     @property
     def serial_number(self) -> str:
         if self.is_posix:
-            return ""
+            try:
+                return self.wmi_detail["serialnumber"]
+            except:
+                return ""
 
         try:
             return self.wmi_detail["bios"][0][0]["SerialNumber"]
         except:
             return ""
+
+    @property
+    def hex_mesh_node_id(self) -> str:
+        try:
+            return _b64_to_hex(self.mesh_node_id)
+        except Exception:
+            return "error"
 
     @classmethod
     def online_agents(cls, min_version: str = "") -> "List[Agent]":
@@ -481,6 +585,7 @@ class Agent(BaseAuditModel):
 
     def get_agent_policies(self) -> "Dict[str, Optional[Policy]]":
         from checks.models import Check
+        from clients.models import Client, Site
 
         site_policy = getattr(self.site, f"{self.monitoring_type}_policy", None)
         client_policy = getattr(self.client, f"{self.monitoring_type}_policy", None)
@@ -488,16 +593,19 @@ class Agent(BaseAuditModel):
             get_core_settings(), f"{self.monitoring_type}_policy", None
         )
 
-        # prefetch excluded objects on polices only if policy is not Non
+        # prefetch excluded objects on polices only if policy is not None
+        # exclusions are only ever checked by pk (is_agent_excluded), so don't
+        # load full rows; a policy with many excluded agents would otherwise
+        # drag every excluded agent's wmi_detail/services into memory
         models.prefetch_related_objects(
             [
                 policy
                 for policy in (self.policy, site_policy, client_policy, default_policy)
                 if policy
             ],
-            "excluded_agents",
-            "excluded_sites",
-            "excluded_clients",
+            models.Prefetch("excluded_agents", queryset=Agent.objects.only("pk")),
+            models.Prefetch("excluded_sites", queryset=Site.objects.only("pk")),
+            models.Prefetch("excluded_clients", queryset=Client.objects.only("pk")),
             models.Prefetch(
                 "policychecks", queryset=Check.objects.select_related("script")
             ),
@@ -505,24 +613,32 @@ class Agent(BaseAuditModel):
         )
 
         return {
-            "agent_policy": self.policy
-            if self.policy and not self.policy.is_agent_excluded(self)
-            else None,
-            "site_policy": site_policy
-            if (site_policy and not site_policy.is_agent_excluded(self))
-            and not self.block_policy_inheritance
-            else None,
-            "client_policy": client_policy
-            if (client_policy and not client_policy.is_agent_excluded(self))
-            and not self.block_policy_inheritance
-            and not self.site.block_policy_inheritance
-            else None,
-            "default_policy": default_policy
-            if (default_policy and not default_policy.is_agent_excluded(self))
-            and not self.block_policy_inheritance
-            and not self.site.block_policy_inheritance
-            and not self.client.block_policy_inheritance
-            else None,
+            "agent_policy": (
+                self.policy
+                if self.policy and not self.policy.is_agent_excluded(self)
+                else None
+            ),
+            "site_policy": (
+                site_policy
+                if (site_policy and not site_policy.is_agent_excluded(self))
+                and not self.block_policy_inheritance
+                else None
+            ),
+            "client_policy": (
+                client_policy
+                if (client_policy and not client_policy.is_agent_excluded(self))
+                and not self.block_policy_inheritance
+                and not self.site.block_policy_inheritance
+                else None
+            ),
+            "default_policy": (
+                default_policy
+                if (default_policy and not default_policy.is_agent_excluded(self))
+                and not self.block_policy_inheritance
+                and not self.site.block_policy_inheritance
+                and not self.client.block_policy_inheritance
+                else None
+            ),
         }
 
     def check_run_interval(self) -> int:
@@ -533,7 +649,9 @@ class Agent(BaseAuditModel):
                 # don't allow check runs less than 15s
                 interval = 15 if check.run_interval < 15 else check.run_interval
 
-        return interval
+        return interval + random.randint(
+            *getattr(settings, "CHECK_INTERVAL_JITTER", (1, 60))
+        )
 
     def run_script(
         self,
@@ -568,6 +686,8 @@ class Agent(BaseAuditModel):
             },
             "run_as_user": run_as_user,
             "env_vars": parsed_env_vars,
+            "nushell_enable_config": settings.NUSHELL_ENABLE_CONFIG,
+            "deno_default_permissions": settings.DENO_DEFAULT_PERMISSIONS,
         }
 
         if history_pk != 0:
@@ -772,7 +892,7 @@ class Agent(BaseAuditModel):
             self.agentchecks.update(overridden_by_policy=False)  # type: ignore
 
             # get agent checks based on policies
-            checks = Policy.get_policy_checks(self)
+            checks = strip_relation_caches_for_cache(Policy.get_policy_checks(self))
             cache.set(cache_key, checks, 600)
             return checks
 
@@ -794,12 +914,9 @@ class Agent(BaseAuditModel):
             return cached_tasks
         else:
             # get agent tasks based on policies
-            tasks = Policy.get_policy_tasks(self)
+            tasks = strip_relation_caches_for_cache(Policy.get_policy_tasks(self))
             cache.set(cache_key, tasks, 600)
             return tasks
-
-    def _do_nats_debug(self, agent: "Agent", message: str) -> None:
-        DebugLog.error(agent=agent, log_type=DebugLogType.AGENT_ISSUES, message=message)
 
     async def nats_cmd(
         self, data: Dict[Any, Any], timeout: int = 30, wait: bool = True
@@ -822,9 +939,7 @@ class Agent(BaseAuditModel):
                     ret = msgpack.loads(msg.data)
                 except Exception as e:
                     ret = str(e)
-                    await sync_to_async(self._do_nats_debug, thread_sensitive=False)(
-                        agent=self, message=ret
-                    )
+                    logger.error(e)
 
             await nc.close()
             return ret
@@ -833,7 +948,124 @@ class Agent(BaseAuditModel):
             await nc.flush()
             await nc.close()
 
-    def recover(self, mode: str, mesh_uri: str, wait: bool = True) -> tuple[str, bool]:
+    async def nats_stream_cmd(
+        self,
+        data: dict,
+        timeout: int = 30,
+        stop_evt: asyncio.Event | None = None,
+        output_subject: str = "",
+        group: str = "",
+    ) -> None:
+        """
+        Publish a command to the agent's NATS subject and stream back line-by-line output.
+        Improvements:
+          - Robust error handling around publish/flush/subscribe (3)
+          - Properly cancel pending waiter after asyncio.wait (2)
+          - Structured logging instead of print (4)
+          - Accept non-string payloads (dict with {line, done, exit_code}) (5)
+          - Include cmd_id in WebSocket messages for frontend filtering (6)
+        """
+        opts = setup_nats_options()
+        channel_layer = get_channel_layer()
+        cmd_id = data.get("payload", {}).get("cmd_id", "")
+
+        try:
+            nc = await nats.connect(**opts)
+        except Exception as e:
+            logger.exception("NATS connect failed for agent %s", self.agent_id)
+            await channel_layer.group_send(
+                group,
+                {
+                    "type": "stream_output",
+                    "cmd_id": cmd_id,
+                    "output": f"[ERROR] Could not connect to NATS: {e}",
+                },
+            )
+            return
+
+        async def message_handler(msg):
+            try:
+                obj = msgpack.loads(msg.data)
+                payload: dict[str, object] = {"cmd_id": cmd_id}
+                if isinstance(obj, str):
+                    payload["output"] = obj
+                elif isinstance(obj, dict):
+                    if isinstance(obj.get("line"), str):
+                        payload["output"] = obj["line"]
+                    if obj.get("done") is True:
+                        payload["done"] = True
+                    if "exit_code" in obj:
+                        payload["exit_code"] = obj["exit_code"]
+                else:
+                    payload["output"] = str(obj)
+                await channel_layer.group_send(
+                    group, {"type": "stream_output", **payload}
+                )
+            except Exception as e:
+                logger.exception(
+                    "Error handling NATS message for agent %s", self.agent_id
+                )
+                await channel_layer.group_send(
+                    group,
+                    {
+                        "type": "stream_output",
+                        "cmd_id": cmd_id,
+                        "output": f"[ERROR] {e}",
+                    },
+                )
+
+        sub = None
+        try:
+            await nc.publish(self.agent_id, msgpack.dumps(data))
+            await nc.flush()
+            sub = await nc.subscribe(output_subject, cb=message_handler)
+        except Exception as e:
+            logger.exception(
+                "NATS publish/subscribe failed for agent %s", self.agent_id
+            )
+            await channel_layer.group_send(
+                group,
+                {
+                    "type": "stream_output",
+                    "cmd_id": cmd_id,
+                    "output": f"[ERROR] NATS publish/subscribe failed: {e}",
+                },
+            )
+            try:
+                await nc.close()
+            except Exception:
+                pass
+            return
+
+        try:
+            if stop_evt is None:
+                await asyncio.sleep(timeout)
+            else:
+                waiter_stop = asyncio.create_task(stop_evt.wait())
+                waiter_sleep = asyncio.create_task(asyncio.sleep(timeout))
+                done, pending = await asyncio.wait(
+                    {waiter_stop, waiter_sleep}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for p in pending:
+                    p.cancel()
+        finally:
+            try:
+                if sub is not None:
+                    await sub.unsubscribe()
+            except Exception:
+                logger.debug(
+                    "NATS unsubscribe failed for agent %s", self.agent_id, exc_info=True
+                )
+            try:
+                await nc.close()
+            except Exception:
+                logger.debug(
+                    "NATS close failed for agent %s", self.agent_id, exc_info=True
+                )
+
+    def recover(
+        self, mode: str, mesh_uri: str, wait: bool = True, agent_url: str = ""
+    ) -> tuple[str, bool]:
         """
         Return type: tuple(message: str, error: bool)
         """
@@ -845,8 +1077,15 @@ class Agent(BaseAuditModel):
                 cmd = "launchctl kickstart -k system/tacticalagent"
                 shell = 3
             else:
-                cmd = "net stop tacticalrmm & taskkill /F /IM tacticalrmm.exe & net start tacticalrmm"
-                shell = 1
+                bin = f"tacticalagent-v{settings.LATEST_AGENT_VER}-{self.plat}-{self.goarch}.exe"
+                cmd = (
+                    f"$url='{agent_url}';"
+                    r"$destDir=Join-Path $env:ProgramData 'TacticalRMM';"
+                    f"$fileName='{bin}';"
+                    r"$fullPath=Join-Path $destDir $fileName;"
+                    r"Invoke-WebRequest -Uri $url -OutFile $fullPath; Start-Process -FilePath $fullPath -ArgumentList '/VERYSILENT' -Wait"
+                )
+                shell = 2
 
             asyncio.run(
                 send_command_with_mesh(cmd, mesh_uri, self.mesh_node_id, shell, 0)
@@ -856,7 +1095,7 @@ class Agent(BaseAuditModel):
         elif mode == "mesh":
             data = {"func": "recover", "payload": {"mode": mode}}
             if wait:
-                r = asyncio.run(self.nats_cmd(data, timeout=20))
+                r = asyncio.run(self.nats_cmd(data, timeout=60))
                 if r == "ok":
                     return "ok", False
                 else:
@@ -907,18 +1146,22 @@ class Agent(BaseAuditModel):
     def should_create_alert(
         self, alert_template: "Optional[AlertTemplate]" = None
     ) -> bool:
-        return bool(
+        has_agent_notification = (
             self.overdue_dashboard_alert
             or self.overdue_email_alert
             or self.overdue_text_alert
-            or (
-                alert_template
-                and (
-                    alert_template.agent_always_alert
-                    or alert_template.agent_always_email
-                    or alert_template.agent_always_text
-                )
-            )
+        )
+        has_alert_template_notification = alert_template and (
+            alert_template.agent_always_alert
+            or alert_template.agent_always_email
+            or alert_template.agent_always_text
+        )
+
+        return bool(
+            has_agent_notification
+            or has_alert_template_notification
+            or has_webhook(alert_template, "agent")
+            or has_script_actions(alert_template, "agent")
         )
 
     def send_outage_email(self) -> None:
@@ -1047,6 +1290,7 @@ class AgentCustomField(models.Model):
 class AgentHistory(models.Model):
     objects = PermissionQuerySet.as_manager()
 
+    id = models.BigAutoField(primary_key=True)
     agent = models.ForeignKey(
         Agent,
         related_name="history",
@@ -1069,6 +1313,15 @@ class AgentHistory(models.Model):
         on_delete=models.SET_NULL,
     )
     script_results = models.JSONField(null=True, blank=True)
+    custom_field = models.ForeignKey(
+        "core.CustomField",
+        null=True,
+        blank=True,
+        related_name="history",
+        on_delete=models.SET_NULL,
+    )
+    collector_all_output = models.BooleanField(default=False)
+    save_to_agent_note = models.BooleanField(default=False)
 
     def __str__(self) -> str:
         return f"{self.agent.hostname} - {self.type}"

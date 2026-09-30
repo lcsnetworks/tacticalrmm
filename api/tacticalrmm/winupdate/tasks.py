@@ -4,6 +4,7 @@ import time
 from contextlib import suppress
 from zoneinfo import ZoneInfo
 
+from django.conf import settings
 from django.utils import timezone as djangotime
 from packaging import version as pyver
 
@@ -16,6 +17,9 @@ from tacticalrmm.constants import AGENT_STATUS_ONLINE, DebugLogType
 @app.task
 def auto_approve_updates_task() -> None:
     # scheduled task that checks and approves updates daily
+
+    if getattr(settings, "TRMM_DISABLE_APPROVE_UPDATES_TASK", False):
+        return
 
     agents = Agent.objects.only(
         "pk", "agent_id", "version", "last_seen", "overdue_time", "offline_time"
@@ -43,20 +47,23 @@ def auto_approve_updates_task() -> None:
 
 @app.task
 def check_agent_update_schedule_task() -> None:
+
+    if getattr(settings, "TRMM_DISABLE_WINUPDATES_INSTALL_TASK", False):
+        return
     # scheduled task that installs updates on agents if enabled
     for agent in Agent.online_agents(min_version="1.3.0"):
+        if agent.is_posix:
+            continue
+
         agent.delete_superseded_updates()
         install = False
-        patch_policy = agent.get_patch_policy()
+        updates_to_install = agent.get_approved_update_guids()
 
-        # check if auto approval is enabled
-        if (
-            patch_policy.critical == "approve"
-            or patch_policy.important == "approve"
-            or patch_policy.moderate == "approve"
-            or patch_policy.low == "approve"
-            or patch_policy.other == "approve"
-        ):
+        # check if agent has approved update to install
+        if updates_to_install:
+
+            patch_policy = agent.get_patch_policy()
+
             # get current time in agent local time
             timezone = ZoneInfo(agent.timezone)
             agent_localtime_now = dt.datetime.now(timezone)
@@ -107,7 +114,7 @@ def check_agent_update_schedule_task() -> None:
                 )
                 nats_data = {
                     "func": "installwinupdates",
-                    "guids": agent.get_approved_update_guids(),
+                    "guids": updates_to_install,
                 }
                 asyncio.run(agent.nats_cmd(nats_data, wait=False))
                 agent.patches_last_installed = djangotime.now()

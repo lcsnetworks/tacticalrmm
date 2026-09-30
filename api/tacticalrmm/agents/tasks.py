@@ -2,6 +2,7 @@ import datetime as dt
 from time import sleep
 from typing import TYPE_CHECKING, Optional
 
+from django.conf import settings
 from django.core.management import call_command
 from django.utils import timezone as djangotime
 
@@ -35,6 +36,9 @@ def send_agent_update_task(*, agent_ids: list[str], token: str, force: bool) -> 
 
 @app.task
 def auto_self_agent_update_task() -> None:
+    if getattr(settings, "TRMM_DISABLE_AGENT_AUTO_UPDATE_TASK", False):
+        return
+
     call_command("update_agents")
 
 
@@ -175,7 +179,7 @@ def run_script_email_results_task(
         return
 
     CORE = get_core_settings()
-    subject = f"{agent.hostname} {script.name} Results"
+    subject = f"{agent.client.name}, {agent.site.name}, {agent.hostname} {script.name} Results"
     exec_time = "{:.4f}".format(r["execution_time"])
     body = (
         subject

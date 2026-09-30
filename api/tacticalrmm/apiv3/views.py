@@ -1,7 +1,11 @@
 import asyncio
+import os
 
 from django.conf import settings
+from django.db import transaction
 from django.db.models import Prefetch
+from django.db.utils import IntegrityError
+from django.http import FileResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone as djangotime
 from packaging import version as pyver
@@ -12,34 +16,40 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from accounts.models import User
-from agents.models import Agent, AgentHistory
+from agents.models import Agent, AgentHistory, Note
 from agents.serializers import AgentHistorySerializer
+from alerts.tasks import cache_agents_alert_template
 from apiv3.utils import get_agent_config
 from autotasks.models import AutomatedTask, TaskResult
 from autotasks.serializers import TaskGOGetSerializer, TaskResultSerializer
 from checks.constants import CHECK_DEFER, CHECK_RESULT_DEFER
 from checks.models import Check, CheckResult
 from checks.serializers import CheckRunnerGetSerializer
+from core.tasks import sync_mesh_perms_task
 from core.utils import (
     download_mesh_agent,
     get_core_settings,
     get_mesh_device_id,
+    get_mesh_installer,
     get_mesh_ws_url,
     get_meshagent_url,
 )
-from logs.models import DebugLog, PendingAction
+from logs.models import DebugLog
 from software.models import InstalledSoftware
 from tacticalrmm.constants import (
     AGENT_DEFER,
+    TRMM_MAX_REQUEST_SIZE,
+    AgentHistoryType,
     AgentMonType,
     AgentPlat,
     AuditActionType,
     AuditObjType,
     CheckStatus,
+    CustomFieldModel,
     DebugLogType,
     GoArch,
     MeshAgentIdent,
-    PAStatus,
+    TaskRunStatus,
 )
 from tacticalrmm.helpers import make_random_password, notify_error
 from tacticalrmm.utils import reload_nats
@@ -53,7 +63,8 @@ class CheckIn(APIView):
     # called once during tacticalagent windows service startup
     def post(self, request):
         agent = get_object_or_404(
-            Agent.objects.defer(*AGENT_DEFER), agent_id=request.data["agent_id"]
+            Agent.objects.defer(*AGENT_DEFER),
+            user=request.user,
         )
         if not agent.choco_installed:
             asyncio.run(agent.nats_cmd({"func": "installchoco"}, wait=False))
@@ -68,11 +79,15 @@ class SyncMeshNodeID(APIView):
 
     def post(self, request):
         agent = get_object_or_404(
-            Agent.objects.defer(*AGENT_DEFER), agent_id=request.data["agent_id"]
+            Agent.objects.defer(*AGENT_DEFER),
+            user=request.user,
         )
         if agent.mesh_node_id != request.data["nodeid"]:
             agent.mesh_node_id = request.data["nodeid"]
             agent.save(update_fields=["mesh_node_id"])
+
+        if request.data.get("run_sync_task"):
+            sync_mesh_perms_task.delay()
 
         return Response("ok")
 
@@ -83,7 +98,8 @@ class Choco(APIView):
 
     def post(self, request):
         agent = get_object_or_404(
-            Agent.objects.defer(*AGENT_DEFER), agent_id=request.data["agent_id"]
+            Agent.objects.defer(*AGENT_DEFER),
+            user=request.user,
         )
         agent.choco_installed = request.data["installed"]
         agent.save(update_fields=["choco_installed"])
@@ -96,7 +112,8 @@ class WinUpdates(APIView):
 
     def put(self, request):
         agent = get_object_or_404(
-            Agent.objects.defer(*AGENT_DEFER), agent_id=request.data["agent_id"]
+            Agent.objects.defer(*AGENT_DEFER),
+            user=request.user,
         )
 
         needs_reboot: bool = request.data["needs_reboot"]
@@ -124,7 +141,8 @@ class WinUpdates(APIView):
 
     def patch(self, request):
         agent = get_object_or_404(
-            Agent.objects.defer(*AGENT_DEFER), agent_id=request.data["agent_id"]
+            Agent.objects.defer(*AGENT_DEFER),
+            user=request.user,
         )
         u = agent.winupdates.filter(guid=request.data["guid"]).last()  # type: ignore
         if not u:
@@ -157,10 +175,15 @@ class WinUpdates(APIView):
             return notify_error("Empty payload")
 
         agent = get_object_or_404(
-            Agent.objects.defer(*AGENT_DEFER), agent_id=request.data["agent_id"]
+            Agent.objects.defer(*AGENT_DEFER),
+            user=request.user,
         )
 
+        returned_guids = list()
+
         for update in updates:
+            returned_guids.append(update["guid"])
+
             if agent.winupdates.filter(guid=update["guid"]).exists():  # type: ignore
                 u = agent.winupdates.filter(guid=update["guid"]).last()  # type: ignore
                 u.downloaded = update["downloaded"]
@@ -189,6 +212,11 @@ class WinUpdates(APIView):
                     revision_number=update["revision_number"],
                 ).save()
 
+        # remove stale updates not returned by agent
+        agent.winupdates.filter(installed=False).exclude(  # type: ignore
+            guid__in=returned_guids
+        ).delete()
+
         agent.delete_superseded_updates()
         return Response("ok")
 
@@ -199,7 +227,8 @@ class SupersededWinUpdate(APIView):
 
     def post(self, request):
         agent = get_object_or_404(
-            Agent.objects.defer(*AGENT_DEFER), agent_id=request.data["agent_id"]
+            Agent.objects.defer(*AGENT_DEFER),
+            user=request.user,
         )
         updates = agent.winupdates.filter(guid=request.data["guid"])  # type: ignore
         for u in updates:
@@ -217,7 +246,7 @@ class RunChecks(APIView):
             Agent.objects.defer(*AGENT_DEFER).prefetch_related(
                 Prefetch("agentchecks", queryset=Check.objects.select_related("script"))
             ),
-            agent_id=agentid,
+            user=request.user,
         )
         checks = agent.get_checks_with_policies(exclude_overridden=True)
         ret = {
@@ -239,7 +268,7 @@ class CheckRunner(APIView):
             Agent.objects.defer(*AGENT_DEFER).prefetch_related(
                 Prefetch("agentchecks", queryset=Check.objects.select_related("script"))
             ),
-            agent_id=agentid,
+            user=request.user,
         )
         checks = agent.get_checks_with_policies(exclude_overridden=True)
 
@@ -277,7 +306,8 @@ class CheckRunner(APIView):
             pk=request.data["id"],
         )
         agent = get_object_or_404(
-            Agent.objects.defer(*AGENT_DEFER), agent_id=request.data["agent_id"]
+            Agent.objects.defer(*AGENT_DEFER),
+            user=request.user,
         )
 
         # get check result or create if doesn't exist
@@ -310,7 +340,7 @@ class CheckRunnerInterval(APIView):
     def get(self, request, agentid):
         agent = get_object_or_404(
             Agent.objects.defer(*AGENT_DEFER).prefetch_related("agentchecks"),
-            agent_id=agentid,
+            user=request.user,
         )
 
         return Response(
@@ -323,20 +353,36 @@ class TaskRunner(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, pk, agentid):
-        agent = get_object_or_404(Agent.objects.defer(*AGENT_DEFER), agent_id=agentid)
-        task = get_object_or_404(AutomatedTask, pk=pk)
+        agent = get_object_or_404(
+            Agent.objects.select_related("policy", "site").defer(*AGENT_DEFER),
+            user=request.user,
+        )
+        task = get_object_or_404(
+            AutomatedTask.objects.select_related("agent", "policy"), pk=pk
+        )
+
+        if task.agent:
+            if task.agent.agent_id != agent.agent_id:
+                return notify_error("")
+        elif task.policy:
+            if pk not in [t.pk for t in agent.get_tasks_with_policies()]:
+                return notify_error("")
+
         return Response(TaskGOGetSerializer(task, context={"agent": agent}).data)
 
     def patch(self, request, pk, agentid):
         from alerts.models import Alert
 
-        agent = get_object_or_404(
-            Agent.objects.defer(*AGENT_DEFER),
-            agent_id=agentid,
-        )
+        agent = get_object_or_404(Agent.objects.defer(*AGENT_DEFER), user=request.user)
         task = get_object_or_404(
             AutomatedTask.objects.select_related("custom_field"), pk=pk
         )
+
+        content_length = request.META.get("CONTENT_LENGTH")
+        if content_length and int(content_length) > TRMM_MAX_REQUEST_SIZE:
+            request.data["stdout"] = ""
+            request.data["stderr"] = "Content truncated due to excessive request size."
+            request.data["retcode"] = 1
 
         # get task result or create if doesn't exist
         try:
@@ -352,11 +398,13 @@ class TaskRunner(APIView):
             serializer = TaskResultSerializer(data=request.data, partial=True)
 
         serializer.is_valid(raise_exception=True)
-        task_result = serializer.save(last_run=djangotime.now())
+        task_result = serializer.save(
+            last_run=djangotime.now(), run_status=TaskRunStatus.COMPLETED
+        )
 
         AgentHistory.objects.create(
             agent=agent,
-            type=AuditActionType.TASK_RUN,
+            type=AgentHistoryType.TASK_RUN,
             command=task.name,
             script_results=request.data,
         )
@@ -374,12 +422,8 @@ class TaskRunner(APIView):
                 CheckStatus.FAILING if task_result.retcode != 0 else CheckStatus.PASSING
             )
 
-        if task_result:
-            task_result.status = status
-            task_result.save(update_fields=["status"])
-        else:
-            task_result.status = status
-            task.save(update_fields=["status"])
+        task_result.status = status
+        task_result.save(update_fields=["status"])
 
         if status == CheckStatus.PASSING:
             if Alert.create_or_return_task_alert(task, agent=agent, skip_create=True):
@@ -426,8 +470,53 @@ class MeshExe(APIView):
 
         try:
             return download_mesh_agent(dl_url)
+        except Exception as e:
+            return notify_error(f"Unable to download mesh agent: {e}")
+
+
+class MeshReinstall(APIView):
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, agentid):
+
+        agent = get_object_or_404(
+            Agent.objects.only("plat", "goarch"), user=request.user
+        )
+        core = get_core_settings()
+
+        try:
+            uri = get_mesh_ws_url()
+            mesh_device_id: str = asyncio.run(
+                get_mesh_device_id(uri, core.mesh_device_group)
+            )
         except:
-            return notify_error("Unable to download mesh agent exe")
+            return notify_error("Unable to connect to mesh to get group id information")
+
+        # windows only for now
+        ident = (
+            MeshAgentIdent.WIN64
+            if agent.goarch == GoArch.AMD64
+            else MeshAgentIdent.WIN32
+        )
+        dl_url = get_meshagent_url(
+            ident=ident,
+            plat=agent.plat,
+            mesh_site=core.mesh_site,  # type: ignore
+            mesh_device_id=mesh_device_id,
+        )
+
+        try:
+            mesh_installer = get_mesh_installer(agent.goarch, dl_url, agent.plat)
+        except Exception as e:
+            return notify_error(str(e))
+
+        response = FileResponse(
+            open(mesh_installer, "rb"),
+            as_attachment=True,
+            filename=os.path.basename(mesh_installer),
+        )
+        return response
 
 
 class NewAgent(APIView):
@@ -436,51 +525,56 @@ class NewAgent(APIView):
 
         """ Creates the agent """
 
-        if Agent.objects.filter(agent_id=request.data["agent_id"]).exists():
+        try:
+            with transaction.atomic():
+                agent = Agent(
+                    agent_id=request.data["agent_id"],
+                    hostname=request.data["hostname"],
+                    site_id=int(request.data["site"]),
+                    monitoring_type=request.data["monitoring_type"],
+                    description=request.data["description"],
+                    mesh_node_id=request.data["mesh_node_id"],
+                    goarch=request.data["goarch"],
+                    plat=request.data["plat"],
+                    last_seen=djangotime.now(),
+                )
+                agent.save()
+
+                user = User.objects.create_user(  # type: ignore
+                    username=request.data["agent_id"],
+                    agent=agent,
+                    password=make_random_password(len=60),
+                )
+
+                token = Token.objects.create(user=user)
+
+                if agent.monitoring_type == AgentMonType.WORKSTATION:
+                    WinUpdatePolicy(agent=agent, run_time_days=[5, 6]).save()
+                else:
+                    WinUpdatePolicy(agent=agent).save()
+
+                # create agent install audit record
+                AuditLog.objects.create(
+                    username=request.user,
+                    agent=agent.hostname,
+                    object_type=AuditObjType.AGENT,
+                    action=AuditActionType.AGENT_INSTALL,
+                    message=f"{request.user} installed new agent {agent.hostname}",
+                    after_value=Agent.serialize(agent),
+                    debug_info={"ip": request._client_ip},
+                )
+        except IntegrityError:
             return notify_error(
                 "Agent already exists. Remove old agent first if trying to re-install"
             )
 
-        agent = Agent(
-            agent_id=request.data["agent_id"],
-            hostname=request.data["hostname"],
-            site_id=int(request.data["site"]),
-            monitoring_type=request.data["monitoring_type"],
-            description=request.data["description"],
-            mesh_node_id=request.data["mesh_node_id"],
-            goarch=request.data["goarch"],
-            plat=request.data["plat"],
-            last_seen=djangotime.now(),
-        )
-        agent.save()
-
-        user = User.objects.create_user(  # type: ignore
-            username=request.data["agent_id"],
-            agent=agent,
-            password=make_random_password(len=60),
-        )
-
-        token = Token.objects.create(user=user)
-
-        if agent.monitoring_type == AgentMonType.WORKSTATION:
-            WinUpdatePolicy(agent=agent, run_time_days=[5, 6]).save()
-        else:
-            WinUpdatePolicy(agent=agent).save()
-
         reload_nats()
-
-        # create agent install audit record
-        AuditLog.objects.create(
-            username=request.user,
-            agent=agent.hostname,
-            object_type=AuditObjType.AGENT,
-            action=AuditActionType.AGENT_INSTALL,
-            message=f"{request.user} installed new agent {agent.hostname}",
-            after_value=Agent.serialize(agent),
-            debug_info={"ip": request._client_ip},
-        )
-
         ret = {"pk": agent.pk, "token": token.key}
+
+        if agent.plat == AgentPlat.WINDOWS:
+            sync_mesh_perms_task.delay()
+
+        cache_agents_alert_template.delay()
         return Response(ret)
 
 
@@ -489,7 +583,7 @@ class Software(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        agent = get_object_or_404(Agent, agent_id=request.data["agent_id"])
+        agent = get_object_or_404(Agent, user=request.user)
         sw = request.data["software"]
         if not InstalledSoftware.objects.filter(agent=agent).exists():
             InstalledSoftware(agent=agent, software=sw).save()
@@ -522,49 +616,54 @@ class Installer(APIView):
         return Response("ok")
 
 
-class ChocoResult(APIView):
-    authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]
-
-    def patch(self, request, pk):
-        action = get_object_or_404(PendingAction, pk=pk)
-        results: str = request.data["results"]
-
-        software_name = action.details["name"].lower()
-        success = [
-            "install",
-            "of",
-            software_name,
-            "was",
-            "successful",
-            "installed",
-        ]
-        duplicate = [software_name, "already", "installed", "--force", "reinstall"]
-        installed = False
-
-        if all(x in results.lower() for x in success):
-            installed = True
-        elif all(x in results.lower() for x in duplicate):
-            installed = True
-
-        action.details["output"] = results
-        action.details["installed"] = installed
-        action.status = PAStatus.COMPLETED
-        action.save(update_fields=["details", "status"])
-        return Response("ok")
-
-
 class AgentHistoryResult(APIView):
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
 
     def patch(self, request, agentid, pk):
+        content_length = request.META.get("CONTENT_LENGTH")
+        if content_length and int(content_length) > TRMM_MAX_REQUEST_SIZE:
+
+            request.data["script_results"]["stdout"] = ""
+            request.data["script_results"][
+                "stderr"
+            ] = "Content truncated due to excessive request size."
+            request.data["script_results"]["retcode"] = 1
+
         hist = get_object_or_404(
-            AgentHistory.objects.filter(agent__agent_id=agentid), pk=pk
+            AgentHistory.objects.select_related("custom_field").filter(
+                agent__user=request.user,
+            ),
+            pk=pk,
         )
         s = AgentHistorySerializer(instance=hist, data=request.data, partial=True)
         s.is_valid(raise_exception=True)
         s.save()
+
+        if hist.custom_field:
+            if hist.custom_field.model == CustomFieldModel.AGENT:
+                field = hist.custom_field.get_or_create_field_value(hist.agent)
+            elif hist.custom_field.model == CustomFieldModel.CLIENT:
+                field = hist.custom_field.get_or_create_field_value(hist.agent.client)
+            elif hist.custom_field.model == CustomFieldModel.SITE:
+                field = hist.custom_field.get_or_create_field_value(hist.agent.site)
+
+            r = request.data["script_results"]["stdout"]
+            value = (
+                r.strip()
+                if hist.collector_all_output
+                else r.strip().split("\n")[-1].strip()
+            )
+
+            field.save_to_field(value)
+
+        if hist.save_to_agent_note:
+            Note.objects.create(
+                agent=hist.agent,
+                user=request.user,
+                note=request.data["script_results"]["stdout"],
+            )
+
         return Response("ok")
 
 

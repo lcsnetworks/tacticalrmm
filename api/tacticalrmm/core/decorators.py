@@ -1,9 +1,12 @@
 import json
+import secrets
+from functools import wraps
 
 from django.conf import settings
 from django.http import HttpResponse
 
 
+# TODO deprecated
 def monitoring_view(function):
     def wrap(request, *args, **kwargs):
         if request.method != "POST":
@@ -21,11 +24,33 @@ def monitoring_view(function):
         if not token:
             return HttpResponse("Missing token\n", status=401)
 
-        if data.get("auth") != token:
+        if not secrets.compare_digest(data.get("auth"), token):
             return HttpResponse("Not authenticated\n", status=401)
 
         return function(request, *args, **kwargs)
 
     wrap.__doc__ = function.__doc__
     wrap.__name__ = function.__name__
+    return wrap
+
+
+def monitoring_view_v2(function):
+    @wraps(function)
+    def wrap(request, *args, **kwargs):
+        if request.method != "GET":
+            return HttpResponse("Invalid request type\n", status=400)
+
+        http_token = request.META.get("HTTP_X_MON_TOKEN")
+        if not http_token:
+            return HttpResponse("Missing X-Mon-Token header\n", status=401)
+
+        mon_token = getattr(settings, "MON_TOKEN", "")
+        if not mon_token:
+            return HttpResponse("Missing mon token\n", status=401)
+
+        if not secrets.compare_digest(http_token, mon_token):
+            return HttpResponse("Not authenticated\n", status=401)
+
+        return function(request, *args, **kwargs)
+
     return wrap

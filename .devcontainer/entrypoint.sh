@@ -33,12 +33,12 @@ function check_tactical_ready {
 }
 
 function django_setup {
-  until (echo > /dev/tcp/"${POSTGRES_HOST}"/"${POSTGRES_PORT}") &> /dev/null; do
+  until (echo >/dev/tcp/"${POSTGRES_HOST}"/"${POSTGRES_PORT}") &>/dev/null; do
     echo "waiting for postgresql container to be ready..."
     sleep 5
   done
 
-  until (echo > /dev/tcp/"${MESH_SERVICE}"/4443) &> /dev/null; do
+  until (echo >/dev/tcp/"${MESH_SERVICE}"/4443) &>/dev/null; do
     echo "waiting for meshcentral container to be ready..."
     sleep 5
   done
@@ -49,8 +49,11 @@ function django_setup {
   MESH_TOKEN="$(cat ${TACTICAL_DIR}/tmp/mesh_token)"
 
   DJANGO_SEKRET=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 80 | head -n 1)
-  
-  localvars="$(cat << EOF
+
+  BASE_DOMAIN=$(echo "import tldextract; no_fetch_extract = tldextract.TLDExtract(suffix_list_urls=()); extracted = no_fetch_extract('${API_HOST}'); print(f'{extracted.domain}.{extracted.suffix}')" | python)
+
+  localvars="$(
+    cat <<EOF
 SECRET_KEY = '${DJANGO_SEKRET}'
 
 DEBUG = True
@@ -64,11 +67,17 @@ KEY_FILE = '${CERT_PRIV_PATH}'
 
 SCRIPTS_DIR = '/community-scripts'
 
-ALLOWED_HOSTS = ['${API_HOST}', '*']
-
 ADMIN_URL = 'admin/'
 
-CORS_ORIGIN_ALLOW_ALL = True
+ALLOWED_HOSTS = ['${API_HOST}', '${APP_HOST}', '*']
+
+CORS_ORIGIN_WHITELIST = ['https://${APP_HOST}']
+
+SESSION_COOKIE_DOMAIN = '${BASE_DOMAIN}'
+CSRF_COOKIE_DOMAIN = '${BASE_DOMAIN}'
+CSRF_TRUSTED_ORIGINS = ['https://${API_HOST}', 'https://${APP_HOST}']
+
+HEADLESS_FRONTEND_URLS = {'socialaccount_login_error': 'https://${APP_HOST}/account/provider/callback'}
 
 DATABASES = {
     'default': {
@@ -78,6 +87,17 @@ DATABASES = {
         'PASSWORD': '${POSTGRES_PASS}',
         'HOST': '${POSTGRES_HOST}',
         'PORT': '${POSTGRES_PORT}',
+    },
+    'reporting': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': '${POSTGRES_DB}',
+        'USER': 'reporting_user',
+        'PASSWORD': 'read_password',
+        'HOST': '${POSTGRES_HOST}',
+        'PORT': '${POSTGRES_PORT}',
+        'OPTIONS': {
+            'options': '-c default_transaction_read_only=on'
+        }
     }
 }
 
@@ -87,14 +107,16 @@ MESH_TOKEN_KEY = '${MESH_TOKEN}'
 REDIS_HOST    = '${REDIS_HOST}'
 MESH_WS_URL = '${MESH_WS_URL}'
 ADMIN_ENABLED = True
+TRMM_INSECURE = True
 EOF
-)"
+  )"
 
-  echo "${localvars}" > ${WORKSPACE_DIR}/api/tacticalrmm/tacticalrmm/local_settings.py
+  echo "${localvars}" >${WORKSPACE_DIR}/api/tacticalrmm/tacticalrmm/local_settings.py
 
   # run migrations and init scripts
   "${VIRTUAL_ENV}"/bin/python manage.py pre_update_tasks
   "${VIRTUAL_ENV}"/bin/python manage.py migrate --no-input
+  "${VIRTUAL_ENV}"/bin/python manage.py generate_json_schemas
   "${VIRTUAL_ENV}"/bin/python manage.py collectstatic --no-input
   "${VIRTUAL_ENV}"/bin/python manage.py initial_db_setup
   "${VIRTUAL_ENV}"/bin/python manage.py initial_mesh_setup
@@ -104,9 +126,8 @@ EOF
   "${VIRTUAL_ENV}"/bin/python manage.py create_natsapi_conf
   "${VIRTUAL_ENV}"/bin/python manage.py create_installer_user
   "${VIRTUAL_ENV}"/bin/python manage.py post_update_tasks
-  
 
-  # create super user 
+  # create super user
   echo "from accounts.models import User; User.objects.create_superuser('${TRMM_USER}', 'admin@example.com', '${TRMM_PASS}') if not User.objects.filter(username='${TRMM_USER}').exists() else 0;" | python manage.py shell
 }
 
@@ -120,6 +141,8 @@ if [ "$1" = 'tactical-init-dev' ]; then
   mkdir -p /meshcentral-data
   mkdir -p ${TACTICAL_DIR}/tmp
   mkdir -p ${TACTICAL_DIR}/certs
+  mkdir -p ${TACTICAL_DIR}/reporting
+  mkdir -p ${TACTICAL_DIR}/reporting/assets
   mkdir -p /mongo/data/db
   mkdir -p /redis/data
   touch /meshcentral-data/.initialized && chown -R 1000:1000 /meshcentral-data
@@ -127,6 +150,7 @@ if [ "$1" = 'tactical-init-dev' ]; then
   touch ${TACTICAL_DIR}/certs/.initialized && chown -R 1000:1000 ${TACTICAL_DIR}/certs
   touch /mongo/data/db/.initialized && chown -R 1000:1000 /mongo/data/db
   touch /redis/data/.initialized && chown -R 1000:1000 /redis/data
+  touch ${TACTICAL_DIR}/reporting && chown -R 1000:1000 ${TACTICAL_DIR}/reporting
   mkdir -p ${TACTICAL_DIR}/api/tacticalrmm/private/exe
   mkdir -p ${TACTICAL_DIR}/api/tacticalrmm/private/log
   touch ${TACTICAL_DIR}/api/tacticalrmm/private/log/django_debug.log

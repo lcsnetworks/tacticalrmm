@@ -1,7 +1,12 @@
-import pytz
+from django.core.cache import cache
 from rest_framework import serializers
 
-from tacticalrmm.constants import AGENT_STATUS_ONLINE
+from tacticalrmm.constants import (
+    AGENT_CHECKS_CACHE_PREFIX,
+    AGENT_STATUS_ONLINE,
+    ALL_TIMEZONES,
+    TerminalModeChoices,
+)
 from winupdate.serializers import WinUpdatePolicySerializer
 
 from .models import Agent, AgentCustomField, AgentHistory, Note
@@ -45,6 +50,10 @@ class AgentSerializer(serializers.ModelSerializer):
     applied_policies = serializers.SerializerMethodField()
     effective_patch_policy = serializers.SerializerMethodField()
     alert_template = serializers.SerializerMethodField()
+    effective_default_shell = serializers.SerializerMethodField()
+
+    def get_effective_default_shell(self, obj):
+        return obj.effective_default_shell
 
     def get_alert_template(self, obj):
         from alerts.serializers import AlertTemplateSerializer
@@ -71,7 +80,7 @@ class AgentSerializer(serializers.ModelSerializer):
         return policies
 
     def get_all_timezones(self, obj):
-        return pytz.all_timezones
+        return ALL_TIMEZONES
 
     class Meta:
         model = Agent
@@ -80,16 +89,15 @@ class AgentSerializer(serializers.ModelSerializer):
 
 class AgentTableSerializer(serializers.ModelSerializer):
     status = serializers.ReadOnlyField()
-    checks = serializers.ReadOnlyField()
-    client_name = serializers.ReadOnlyField(source="client.name")
+    checks = serializers.SerializerMethodField()
+    client_name = serializers.ReadOnlyField(source="site.client.name")
     site_name = serializers.ReadOnlyField(source="site.name")
     logged_username = serializers.SerializerMethodField()
     italic = serializers.SerializerMethodField()
     policy = serializers.ReadOnlyField(source="policy.id")
     alert_template = serializers.SerializerMethodField()
-    last_seen = serializers.ReadOnlyField()
-    pending_actions_count = serializers.ReadOnlyField()
-    has_patches_pending = serializers.ReadOnlyField()
+    pending_actions_count = serializers.SerializerMethodField()
+    has_patches_pending = serializers.SerializerMethodField()
     cpu_model = serializers.ReadOnlyField()
     graphics = serializers.ReadOnlyField()
     local_ips = serializers.ReadOnlyField()
@@ -97,6 +105,25 @@ class AgentTableSerializer(serializers.ModelSerializer):
     physical_disks = serializers.ReadOnlyField()
     serial_number = serializers.ReadOnlyField()
     custom_fields = AgentCustomFieldSerializer(many=True, read_only=True)
+
+    def get_has_patches_pending(self, obj) -> bool:
+        return getattr(obj, "has_patches_pending", False)
+
+    def get_checks(self, obj) -> dict:
+        data = cache.get(f"{AGENT_CHECKS_CACHE_PREFIX}{obj.pk}")
+        if data is None:
+            return {
+                "total": 0,
+                "passing": 0,
+                "failing": 0,
+                "warning": 0,
+                "info": 0,
+                "has_failing_checks": False,
+            }
+        return data
+
+    def get_pending_actions_count(self, obj) -> int:
+        return getattr(obj, "_pending_actions_count", 0)
 
     def get_alert_template(self, obj):
         if not obj.alert_template:
@@ -158,7 +185,6 @@ class AgentTableSerializer(serializers.ModelSerializer):
             "custom_fields",
             "serial_number",
         ]
-        depth = 2
 
 
 class AgentHostnameSerializer(serializers.ModelSerializer):
@@ -198,3 +224,36 @@ class AgentAuditSerializer(serializers.ModelSerializer):
     class Meta:
         model = Agent
         exclude = ["disks", "services", "wmi_detail"]
+
+
+class AgentTerminalDefaultsSerializer(serializers.ModelSerializer):
+    effective_default_shell = serializers.SerializerMethodField()
+    resolved_default_shell = serializers.SerializerMethodField()
+    terminal_mode = serializers.SerializerMethodField()
+    supports_new_terminal = serializers.SerializerMethodField()
+
+    def get_effective_default_shell(self, obj):
+        return obj.effective_default_shell
+
+    def get_resolved_default_shell(self, obj):
+        return obj.resolved_default_shell
+
+    def get_terminal_mode(self, obj):
+        settings = self.context.get("core_settings")
+        return settings.terminal_mode if settings else TerminalModeChoices.NEW
+
+    def get_supports_new_terminal(self, obj):
+        return self.context.get("supports_new_terminal", True)
+
+    class Meta:
+        model = Agent
+        fields = (
+            "agent_id",
+            "hostname",
+            "plat",
+            "default_shell",
+            "resolved_default_shell",
+            "effective_default_shell",
+            "terminal_mode",
+            "supports_new_terminal",
+        )

@@ -4,7 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"os"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
@@ -20,7 +21,10 @@ func GetConfig(cfg string) (db *sqlx.DB, r DjangoConfig, err error) {
 		}
 	}
 
-	jret, _ := ioutil.ReadFile(cfg)
+	jret, err := os.ReadFile(cfg)
+	if err != nil {
+		return
+	}
 	err = json.Unmarshal(jret, &r)
 	if err != nil {
 		return
@@ -35,5 +39,7 @@ func GetConfig(cfg string) (db *sqlx.DB, r DjangoConfig, err error) {
 		return
 	}
 	db.SetMaxOpenConns(20)
+	db.SetMaxIdleConns(20)
+	db.SetConnMaxIdleTime(5 * time.Minute)
 	return
 }

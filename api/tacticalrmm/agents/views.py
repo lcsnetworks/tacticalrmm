@@ -7,7 +7,7 @@ from io import StringIO
 from pathlib import Path
 
 from django.conf import settings
-from django.db.models import Exists, OuterRef, Prefetch, Q
+from django.db.models import Count, Exists, OuterRef, Prefetch, Q
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone as djangotime
@@ -21,6 +21,10 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from agents.utils import get_agent_url
+from core.models import CoreSettings
+from core.permissions import RunServerScriptPerms
+from core.tasks import sync_mesh_perms_task
 from core.utils import (
     get_core_settings,
     get_mesh_ws_url,
@@ -32,19 +36,24 @@ from logs.models import AuditLog, DebugLog, PendingAction
 from scripts.models import Script
 from scripts.tasks import bulk_command_task, bulk_script_task
 from tacticalrmm.constants import (
+    AGENT_DARWIN_SHELL_TOKENS,
     AGENT_DEFER,
+    AGENT_LINUX_SHELL_TOKENS,
     AGENT_STATUS_OFFLINE,
     AGENT_STATUS_ONLINE,
-    AGENT_TABLE_DEFER,
+    AGENT_WINDOWS_SHELL_TOKENS,
     AgentHistoryType,
     AgentMonType,
     AgentPlat,
+    AgentTerminalShellChoices,
     CustomFieldModel,
     DebugLogType,
     EvtLogNames,
     PAAction,
+    PAStatus,
 )
 from tacticalrmm.helpers import date_is_in_past, notify_error
+from tacticalrmm.pagination import StandardPagination
 from tacticalrmm.permissions import (
     _has_perm_on_agent,
     _has_perm_on_client,
@@ -60,12 +69,13 @@ from .permissions import (
     AgentHistoryPerms,
     AgentNotesPerms,
     AgentPerms,
+    AgentRegistryPerms,
+    AgentTerminalPerms,
     AgentWOLPerms,
     EvtLogPerms,
     InstallAgentPerms,
     ManageProcPerms,
     MeshPerms,
-    PingAgentPerms,
     RebootAgentPerms,
     RecoverAgentPerms,
     RunBulkPerms,
@@ -80,20 +90,20 @@ from .serializers import (
     AgentNoteSerializer,
     AgentSerializer,
     AgentTableSerializer,
+    AgentTerminalDefaultsSerializer,
 )
 from .tasks import (
     bulk_recover_agents_task,
     run_script_email_results_task,
     send_agent_update_task,
 )
+from .utils import get_validated_agent, send_nats_command
 
 
 class GetAgents(APIView):
     permission_classes = [IsAuthenticated, AgentPerms]
 
     def get(self, request):
-        from checks.models import Check, CheckResult
-
         monitoring_type_filter = Q()
         client_site_filter = Q()
 
@@ -119,24 +129,12 @@ class GetAgents(APIView):
                 Agent.objects.filter_by_role(request.user)  # type: ignore
                 .filter(monitoring_type_filter)
                 .filter(client_site_filter)
-                .defer(*AGENT_TABLE_DEFER)
                 .select_related(
-                    "site__server_policy",
-                    "site__workstation_policy",
-                    "site__client__server_policy",
-                    "site__client__workstation_policy",
+                    "site__client",
                     "policy",
                     "alert_template",
                 )
                 .prefetch_related(
-                    Prefetch(
-                        "agentchecks",
-                        queryset=Check.objects.select_related("script"),
-                    ),
-                    Prefetch(
-                        "checkresults",
-                        queryset=CheckResult.objects.select_related("assigned_check"),
-                    ),
                     Prefetch(
                         "custom_fields",
                         queryset=AgentCustomField.objects.select_related("field"),
@@ -148,6 +146,17 @@ class GetAgents(APIView):
                             agent_id=OuterRef("pk"), action="approve", installed=False
                         )
                     ),
+                    _pending_actions_count=Count(
+                        "pendingactions",
+                        filter=Q(pendingactions__status=PAStatus.PENDING),
+                    ),
+                )
+                .defer(
+                    "services",
+                    "created_by",
+                    "created_time",
+                    "modified_by",
+                    "modified_time",
                 )
             )
             serializer = AgentTableSerializer(agents, many=True)
@@ -170,6 +179,53 @@ class GetUpdateDeleteAgent(APIView):
     permission_classes = [IsAuthenticated, AgentPerms]
 
     class InputSerializer(serializers.ModelSerializer):
+        def validate(self, attrs):
+            agent = self.instance
+            shell = attrs.get("default_shell", getattr(agent, "default_shell", None))
+            custom = attrs.get(
+                "default_shell_custom", getattr(agent, "default_shell_custom", "")
+            )
+
+            shell = (shell or "").strip().lower()
+            custom = (custom or "").strip()
+
+            if shell in ("", "none", "null"):
+                shell = AgentTerminalShellChoices.USE_GLOBAL
+                attrs["default_shell"] = AgentTerminalShellChoices.USE_GLOBAL
+
+            if agent.plat == AgentPlat.WINDOWS:
+                allowed = AGENT_WINDOWS_SHELL_TOKENS
+                msg = (
+                    "Invalid default shell for Windows agent. "
+                    "Use global default, 'cmd', 'powershell' or 'custom'."
+                )
+            elif agent.plat == AgentPlat.LINUX:
+                allowed = AGENT_LINUX_SHELL_TOKENS
+                msg = (
+                    "Invalid default shell for Linux agent. "
+                    "Use global default, 'bash' or 'custom'."
+                )
+            elif agent.plat == AgentPlat.DARWIN:
+                allowed = AGENT_DARWIN_SHELL_TOKENS
+                msg = (
+                    "Invalid default shell for macOS agent. "
+                    "Use global default, 'bash' or 'custom'."
+                )
+            else:
+                allowed = {AgentTerminalShellChoices.USE_GLOBAL}
+                msg = "Invalid default shell for this agent OS."
+
+            if shell not in allowed:
+                raise serializers.ValidationError({"default_shell": msg})
+
+            if shell == AgentTerminalShellChoices.CUSTOM and not custom:
+                raise serializers.ValidationError(
+                    {"default_shell_custom": "Custom shell path must be provided."}
+                )
+
+            attrs["default_shell"] = shell
+            return attrs
+
         class Meta:
             model = Agent
             fields = [
@@ -186,6 +242,8 @@ class GetUpdateDeleteAgent(APIView):
                 "check_interval",
                 "time_zone",
                 "site",
+                "default_shell",
+                "default_shell_custom",
             ]
 
     # get agent details
@@ -259,6 +317,7 @@ class GetUpdateDeleteAgent(APIView):
                     serializer.is_valid(raise_exception=True)
                     serializer.save()
 
+        sync_mesh_perms_task.delay()
         return Response("The agent was updated successfully")
 
     # uninstall agent
@@ -284,6 +343,7 @@ class GetUpdateDeleteAgent(APIView):
                 message=f"Unable to remove agent {name} from meshcentral database: {e}",
                 log_type=DebugLogType.AGENT_ISSUES,
             )
+        sync_mesh_perms_task.delay()
         return Response(f"{name} will now be uninstalled.")
 
 
@@ -318,21 +378,73 @@ class AgentProcesses(APIView):
         return Response(f"Process with PID: {pid} was ended successfully")
 
 
+class WebVNC(APIView):
+    permission_classes = [IsAuthenticated, MeshPerms]
+
+    def get(self, request, agent_id, port):
+        from urllib.parse import urlparse
+
+        from core.mesh_utils import MeshSync
+
+        agent = get_object_or_404(
+            Agent.objects.select_related("site__client").defer(*AGENT_DEFER),
+            agent_id=agent_id,
+        )
+        if agent.hex_mesh_node_id == "error":
+            return notify_error("Missing mesh node id")
+
+        core = get_core_settings()
+
+        uri = get_mesh_ws_url()
+        ms = MeshSync(uri)
+
+        payload = {
+            "action": "getcookie",
+            "name": None,
+            "nodeid": f"node//{agent.hex_mesh_node_id}",
+            "tag": "novnc",
+            "tcpaddr": None,
+            "tcpport": int(port),
+        }
+        cookie_ret = ms.mesh_action(payload=payload, wait=True)
+
+        vnc_url = (
+            core.mesh_site
+            + "/novnc/vnc.html?ws=wss%3A%2F%2F"
+            + urlparse(core.mesh_site).netloc
+            + "%2F"
+            + "meshrelay.ashx%3Fauth%3D"
+            + cookie_ret["cookie"]  # type: ignore
+            + f"&show_dot=1&l=en&resize=scale&name={agent.hostname}"
+        )
+
+        ret = {
+            "hostname": agent.hostname,
+            "vnc": vnc_url,
+            "client": agent.client.name,
+            "site": agent.site.name,
+        }
+        return Response(ret)
+
+
 class AgentMeshCentral(APIView):
     permission_classes = [IsAuthenticated, MeshPerms]
 
     # get mesh urls
     def get(self, request, agent_id):
-        agent = get_object_or_404(Agent, agent_id=agent_id)
+        agent = get_object_or_404(
+            Agent.objects.select_related("site__client").defer(*AGENT_DEFER),
+            agent_id=agent_id,
+        )
         core = get_core_settings()
 
-        if not core.mesh_disable_auto_login:
-            token = get_login_token(
-                key=core.mesh_token, user=f"user//{core.mesh_username}"
-            )
-            token_param = f"login={token}&"
-        else:
-            token_param = ""
+        user = (
+            request.user.mesh_user_id
+            if core.sync_mesh_with_trmm
+            else f"user//{core.mesh_api_superuser}"
+        )
+        token = get_login_token(key=core.mesh_token, user=user)
+        token_param = f"login={token}&"
 
         control = f"{core.mesh_site}/?{token_param}gotonode={agent.mesh_node_id}&viewmode=11&hide=31"
         terminal = f"{core.mesh_site}/?{token_param}gotonode={agent.mesh_node_id}&viewmode=12&hide=31"
@@ -402,7 +514,7 @@ def update_agents(request):
 
 
 @api_view(["GET"])
-@permission_classes([IsAuthenticated, PingAgentPerms])
+@permission_classes([IsAuthenticated, AgentPerms])
 def ping(request, agent_id):
     agent = get_object_or_404(Agent, agent_id=agent_id)
     status = AGENT_STATUS_OFFLINE
@@ -492,6 +604,19 @@ def send_raw_cmd(request, agent_id):
     return Response(r)
 
 
+class Shutdown(APIView):
+    permission_classes = [IsAuthenticated, RebootAgentPerms]
+
+    # shutdown
+    def post(self, request, agent_id):
+        agent = get_object_or_404(Agent, agent_id=agent_id)
+        r = asyncio.run(agent.nats_cmd({"func": "shutdown"}, timeout=10))
+        if r != "ok":
+            return notify_error("Unable to contact the agent")
+
+        return Response("ok")
+
+
 class Reboot(APIView):
     permission_classes = [IsAuthenticated, RebootAgentPerms]
 
@@ -567,7 +692,6 @@ def install_agent(request):
     from knox.models import AuthToken
 
     from accounts.models import User
-    from agents.utils import get_agent_url
     from core.utils import token_is_valid
 
     insecure = getattr(settings, "TRMM_INSECURE", False)
@@ -667,7 +791,7 @@ def install_agent(request):
                 "ping",
                 "127.0.0.1",
                 "-n",
-                "5",
+                "7",
                 "&&",
                 r'"C:\Program Files\TacticalAgent\tacticalrmm.exe"',
             ] + install_flags
@@ -732,7 +856,11 @@ def recover(request, agent_id: str) -> Response:
 
     if mode == "tacagent":
         uri = get_mesh_ws_url()
-        agent.recover(mode, uri, wait=False)
+        code_token, _ = token_is_valid()
+        agent_url = get_agent_url(
+            goarch=agent.goarch, plat=agent.plat, token=code_token
+        )
+        agent.recover(mode, uri, wait=False, agent_url=agent_url)
         return Response("Recovery will be attempted shortly")
 
     elif mode == "mesh":
@@ -753,6 +881,14 @@ def run_script(request, agent_id):
     run_as_user: bool = request.data["run_as_user"]
     env_vars: list[str] = request.data["env_vars"]
     req_timeout = int(request.data["timeout"]) + 3
+    run_on_server: bool | None = request.data.get("run_on_server")
+
+    if run_on_server:
+        if not get_core_settings().server_scripts_enabled:
+            return notify_error("This feature is disabled.")
+
+        if not RunServerScriptPerms().has_permission(request, None):
+            raise PermissionDenied()
 
     AuditLog.audit_script_run(
         username=request.user.username,
@@ -768,6 +904,29 @@ def run_script(request, agent_id):
         username=request.user.username[:50],
     )
     history_pk = hist.pk
+
+    if run_on_server:
+        from core.utils import run_server_script
+
+        r = run_server_script(
+            body=script.script_body,
+            args=script.parse_script_args(agent, script.shell, args),
+            env_vars=script.parse_script_env_vars(agent, script.shell, env_vars),
+            shell=script.shell,
+            timeout=req_timeout,
+        )
+
+        ret = {
+            "stdout": r[0],
+            "stderr": r[1],
+            "execution_time": "{:.4f}".format(r[2]),
+            "retcode": r[3],
+        }
+
+        hist.script_results = {**ret, "id": history_pk}
+        hist.save(update_fields=["script_results"])
+
+        return Response(ret)
 
     if output == "wait":
         r = agent.run_script(
@@ -972,6 +1131,8 @@ def bulk(request):
         debug_info={"ip": request._client_ip},
     )
 
+    ht = "Check the History tab on the agent to view the results."
+
     if request.data["mode"] == "command":
         if request.data["shell"] == "custom" and request.data["custom_shell"]:
             shell = request.data["custom_shell"]
@@ -986,10 +1147,20 @@ def bulk(request):
             username=request.user.username[:50],
             run_as_user=request.data["run_as_user"],
         )
-        return Response(f"Command will now be run on {len(agents)} agents")
+        return Response(f"Command will now be run on {len(agents)} agents. {ht}")
 
     elif request.data["mode"] == "script":
         script = get_object_or_404(Script, pk=request.data["script"])
+
+        # prevent API from breaking for those who haven't updated payload
+        try:
+            custom_field_pk = request.data["custom_field"]
+            collector_all_output = request.data["collector_all_output"]
+            save_to_agent_note = request.data["save_to_agent_note"]
+        except KeyError:
+            custom_field_pk = None
+            collector_all_output = False
+            save_to_agent_note = False
 
         bulk_script_task.delay(
             script_pk=script.pk,
@@ -999,9 +1170,12 @@ def bulk(request):
             username=request.user.username[:50],
             run_as_user=request.data["run_as_user"],
             env_vars=request.data["env_vars"],
+            custom_field_pk=custom_field_pk,
+            collector_all_output=collector_all_output,
+            save_to_agent_note=save_to_agent_note,
         )
 
-        return Response(f"{script.name} will now be run on {len(agents)} agents")
+        return Response(f"{script.name} will now be run on {len(agents)} agents. {ht}")
 
     elif request.data["mode"] == "patch":
         if request.data["patchMode"] == "install":
@@ -1070,6 +1244,8 @@ class WMI(APIView):
 
 
 class AgentHistoryView(APIView):
+    # TODO deprecated
+
     permission_classes = [IsAuthenticated, AgentHistoryPerms]
 
     def get(self, request, agent_id=None):
@@ -1080,6 +1256,30 @@ class AgentHistoryView(APIView):
             history = AgentHistory.objects.filter_by_role(request.user)  # type: ignore
         ctx = {"default_tz": get_default_timezone()}
         return Response(AgentHistorySerializer(history, many=True, context=ctx).data)
+
+
+class AgentHistoryViewV2(APIView):
+    permission_classes = [IsAuthenticated, AgentHistoryPerms]
+    ordering_fields = ("time", "type", "command", "username")
+
+    def get(self, request, agent_id=None):
+        if agent_id:
+            agent = get_object_or_404(Agent, agent_id=agent_id)
+            history = AgentHistory.objects.filter(agent=agent)
+        else:
+            history = AgentHistory.objects.filter_by_role(request.user)  # type: ignore
+
+        ordering = request.query_params.get("ordering", "-time")
+        if ordering.lstrip("-") not in self.ordering_fields:
+            ordering = "-time"
+        # id as tiebreaker so rows never shift between pages
+        history = history.select_related("script").order_by(ordering, "-id")
+
+        paginator = StandardPagination()
+        page = paginator.paginate_queryset(history, request, view=self)
+        ctx = {"default_tz": get_default_timezone()}
+        serializer = AgentHistorySerializer(page, many=True, context=ctx)
+        return paginator.get_paginated_response(serializer.data)
 
 
 class ScriptRunHistory(APIView):
@@ -1190,3 +1390,283 @@ def wol(request, agent_id):
     except Exception as e:
         return notify_error(str(e))
     return Response(f"Wake-on-LAN sent to {agent.hostname}")
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated, AgentRegistryPerms])
+def browse_registry(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    path = request.query_params.get("path", "Computer").strip()
+    if path.lower() == "computer":
+        path = "Computer"
+
+    try:
+        page = int(request.query_params.get("page", 1))
+        page_size = int(request.query_params.get("page_size", 200))
+    except ValueError:
+        return notify_error("page and page_size must be integers")
+
+    payload = {"path": path, "page": str(page), "page_size": str(page_size)}
+    r = send_nats_command(agent, "registry_browse", payload, timeout=30)
+
+    if isinstance(r, Response):
+        return r
+
+    return Response(
+        {
+            "path": r.get("path", path),
+            "subkeys": r.get("subkeys", []),
+            "values": r.get("values", []),
+            "has_more": r.get("has_more", False),
+            "page": page,
+            "page_size": page_size,
+        }
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, AgentRegistryPerms])
+def create_registry_key(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    path = (request.data.get("path") or "").strip()
+    if not path:
+        return notify_error("Registry path is required")
+
+    payload = {"path": path}
+    r = send_nats_command(agent, "registry_create_key", payload, timeout=30)
+
+    if isinstance(r, Response):
+        return r
+
+    return Response({"status": "success", "path": path})
+
+
+@api_view(["DELETE"])
+@permission_classes([IsAuthenticated, AgentRegistryPerms])
+def delete_registry_key(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    path = (request.query_params.get("path") or "").strip()
+    if not path:
+        return notify_error("Registry path is required")
+
+    payload = {"path": path}
+    r = send_nats_command(agent, "registry_delete_key", payload, timeout=30)
+
+    if isinstance(r, Response):
+        return r
+
+    return Response({"status": "success", "deleted_path": path})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, AgentRegistryPerms])
+def rename_registry_key(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    old_path = (request.data.get("old_path") or "").strip()
+    new_path = (request.data.get("new_path") or "").strip()
+
+    if not old_path or not new_path:
+        return notify_error("Both 'old_path' and 'new_path' are required")
+    if old_path == new_path:
+        return notify_error("Old and new path cannot be the same")
+
+    payload = {"old_path": old_path, "new_path": new_path}
+    r = send_nats_command(agent, "registry_rename_key", payload, timeout=60)
+
+    if isinstance(r, Response):
+        return r
+
+    return Response(
+        {
+            "status": "success",
+            "old_path": old_path,
+            "new_path": new_path,
+        }
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, AgentRegistryPerms])
+def create_registry_value(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    path = (request.data.get("path") or "").strip()
+    val_name = request.data.get("name")
+    val_type = (request.data.get("type") or "").strip().upper()
+    val_data = request.data.get("data")
+
+    if not path:
+        return notify_error("Registry path is required")
+    if not val_type:
+        return notify_error("Registry value type is required")
+    if not val_name:
+        return notify_error("Registry value name is required")
+
+    payload = {
+        "path": path,
+        "type": val_type,
+        "name": val_name,
+        "data": val_data,
+    }
+
+    r = send_nats_command(agent, "registry_create_value", payload, timeout=30)
+
+    if isinstance(r, Response):
+        return r
+
+    return Response(
+        {
+            "status": "success",
+            "data": {
+                "name": r.get("name", val_name),
+                "type": r.get("type", val_type),
+                "data": r.get("data", val_data),
+            },
+        }
+    )
+
+
+@api_view(["DELETE"])
+@permission_classes([IsAuthenticated, AgentRegistryPerms])
+def delete_registry_value(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    path = (request.query_params.get("path") or "").strip()
+    val_name = request.query_params.get("name")
+
+    if not path:
+        return notify_error("Registry path is required")
+    if not val_name:
+        return notify_error("Registry value name is required")
+
+    payload = {"path": path, "name": val_name}
+    r = send_nats_command(agent, "registry_delete_value", payload, timeout=30)
+
+    if isinstance(r, Response):
+        return r
+
+    return Response({"status": "success", "name": val_name})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, AgentRegistryPerms])
+def rename_registry_value(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    path = (request.data.get("path") or "").strip()
+    old_name = request.data.get("old_name")
+    new_name = request.data.get("new_name")
+
+    if not path:
+        return notify_error("Registry path is required")
+    if not old_name:
+        return notify_error("Old value name is required")
+    if not new_name:
+        return notify_error("New value name is required")
+    if old_name == new_name:
+        return notify_error("Old and new value names cannot be the same")
+
+    payload = {
+        "path": path,
+        "old_name": old_name,
+        "new_name": new_name,
+    }
+
+    r = send_nats_command(agent, "registry_rename_value", payload, timeout=30)
+
+    if isinstance(r, Response):
+        return r
+
+    return Response(
+        {
+            "status": "success",
+            "old_name": old_name,
+            "new_name": r.get("new_name", new_name),
+        }
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, AgentRegistryPerms])
+def modify_registry_value(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    path = (request.data.get("path") or "").strip()
+    val_name = request.data.get("name")
+    val_type = (request.data.get("type") or "").strip().upper()
+    val_data = request.data.get("data")
+
+    if not path:
+        return notify_error("Registry path is required")
+    if not val_name:
+        return notify_error("Registry value name is required")
+    if not val_type:
+        return notify_error("Registry value type is required")
+
+    payload = {
+        "path": path,
+        "name": val_name,
+        "type": val_type,
+        "data": val_data,
+    }
+
+    r = send_nats_command(agent, "registry_modify_value", payload, timeout=30)
+
+    if isinstance(r, Response):
+        return r
+
+    return Response(
+        {
+            "status": "success",
+            "data": {
+                "name": r.get("name", val_name),
+                "type": r.get("type", val_type),
+                "data": r.get("data", val_data),
+            },
+        }
+    )
+
+
+class AgentTerminalDefaults(APIView):
+    permission_classes = [IsAuthenticated, AgentTerminalPerms]
+
+    def get(self, request, agent_id):
+        agent = get_object_or_404(
+            Agent.objects.filter_by_role(request.user).defer(*AGENT_DEFER),
+            agent_id=agent_id,
+        )
+
+        supports_new_terminal = True
+        if pyver.parse(agent.version) < pyver.parse("2.11.0"):
+            supports_new_terminal = False
+
+        core_settings = CoreSettings.objects.only("terminal_mode").first()
+        return Response(
+            AgentTerminalDefaultsSerializer(
+                agent,
+                context={
+                    "core_settings": core_settings,
+                    "supports_new_terminal": supports_new_terminal,
+                },
+            ).data
+        )

@@ -9,13 +9,15 @@ from django.conf import settings
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "tacticalrmm.settings")
 
-app = Celery("tacticalrmm", backend="redis://" + settings.REDIS_HOST, broker="redis://" + settings.REDIS_HOST)  # type: ignore
+redis_host = f"redis://{settings.REDIS_HOST}"
+app = Celery("tacticalrmm", backend=redis_host, broker=redis_host)
 app.accept_content = ["application/json"]
 app.result_serializer = "json"
 app.task_serializer = "json"
 app.conf.task_track_started = True
 app.conf.worker_proc_alive_timeout = 30
 app.conf.worker_max_tasks_per_child = 2
+app.conf.broker_connection_retry_on_startup = True
 app.autodiscover_tasks()
 
 app.conf.beat_schedule = {
@@ -33,7 +35,7 @@ app.conf.beat_schedule = {
     },
     "remove-orphaned-tasks": {
         "task": "autotasks.tasks.remove_orphaned_win_tasks",
-        "schedule": crontab(minute=50, hour="12"),
+        "schedule": crontab(minute=50, hour="*/2"),
     },
     "agent-outages-task": {
         "task": "agents.tasks.agent_outages_task",
@@ -55,6 +57,10 @@ app.conf.beat_schedule = {
         "task": "core.tasks.sync_scheduled_tasks",
         "schedule": crontab(minute="*/2", hour="*"),
     },
+    "sync-mesh-perms-task": {
+        "task": "core.tasks.sync_mesh_perms_task",
+        "schedule": crontab(minute="*/4", hour="*"),
+    },
     "resolve-pending-actions": {
         "task": "core.tasks.resolve_pending_actions",
         "schedule": timedelta(seconds=100.0),
@@ -62,6 +68,14 @@ app.conf.beat_schedule = {
     "resolve-alerts-task": {
         "task": "core.tasks.resolve_alerts_task",
         "schedule": timedelta(seconds=80.0),
+    },
+    "trmm-scheduler": {
+        "task": "core.tasks.scheduled_task_runner",
+        "schedule": crontab(),
+    },
+    "trmm-reports-scheduler": {
+        "task": "ee.reporting.tasks.scheduled_reports_runner",
+        "schedule": crontab(),
     },
 }
 

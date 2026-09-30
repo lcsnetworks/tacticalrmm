@@ -1,9 +1,12 @@
+from __future__ import annotations
+
+import calendar
+import os
 import random
 import secrets
 import string
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
+from typing import TYPE_CHECKING, Any, Literal
 from zoneinfo import ZoneInfo
 
 from cryptography import x509
@@ -12,8 +15,12 @@ from django.utils import timezone as djangotime
 from rest_framework import status
 from rest_framework.response import Response
 
+from tacticalrmm.constants import MONTHS, WEEKDAY_TO_BIT
+
 if TYPE_CHECKING:
     from datetime import datetime
+
+    from alerts.models import AlertTemplate
 
 
 def get_certs() -> tuple[str, str]:
@@ -43,10 +50,49 @@ def get_nats_ports() -> tuple[int, int]:
 
 
 def get_nats_internal_protocol() -> str:
-    if getattr(settings, "TRMM_INSECURE", False):
-        return "nats"
+    if getattr(settings, "USE_NATS_STANDARD", False):
+        return "tls"
 
-    return "tls"
+    return "nats"
+
+
+def get_nats_hosts() -> tuple[str, str, str]:
+    std_bind_host = "0.0.0.0"
+    ws_bind_host = "0.0.0.0"
+    connect_host = settings.ALLOWED_HOSTS[0]
+
+    # standard install
+    if not settings.DOCKER_BUILD and not getattr(settings, "USE_NATS_STANDARD", False):
+        std_bind_host, ws_bind_host, connect_host = (
+            "127.0.0.1",
+            "127.0.0.1",
+            "127.0.0.1",
+        )
+
+    # allow customizing all nats hosts
+    if "NATS_STD_BIND_HOST" in os.environ:
+        std_bind_host = os.getenv("NATS_STD_BIND_HOST")
+    elif hasattr(settings, "NATS_STD_BIND_HOST"):
+        std_bind_host = settings.NATS_STD_BIND_HOST
+
+    if "NATS_WS_BIND_HOST" in os.environ:
+        ws_bind_host = os.getenv("NATS_WS_BIND_HOST")
+    elif hasattr(settings, "NATS_WS_BIND_HOST"):
+        ws_bind_host = settings.NATS_WS_BIND_HOST
+
+    if "NATS_CONNECT_HOST" in os.environ:
+        connect_host = os.getenv("NATS_CONNECT_HOST")
+    elif hasattr(settings, "NATS_CONNECT_HOST"):
+        connect_host = settings.NATS_CONNECT_HOST
+
+    return std_bind_host, ws_bind_host, connect_host
+
+
+def get_nats_url() -> str:
+    _, _, connect_host = get_nats_hosts()
+    proto = get_nats_internal_protocol()
+    port, _ = get_nats_ports()
+    return f"{proto}://{connect_host}:{port}"
 
 
 def date_is_in_past(*, datetime_obj: "datetime", agent_tz: str) -> bool:
@@ -59,10 +105,6 @@ def date_is_in_past(*, datetime_obj: "datetime", agent_tz: str) -> bool:
     return djangotime.now() > utc_time
 
 
-def get_webdomain() -> str:
-    return urlparse(settings.CORS_ORIGIN_WHITELIST[0]).netloc
-
-
 def rand_range(min: int, max: int) -> float:
     """
     Input is milliseconds.
@@ -72,10 +114,8 @@ def rand_range(min: int, max: int) -> float:
 
 
 def setup_nats_options() -> dict[str, Any]:
-    nats_std_port, _ = get_nats_ports()
-    proto = get_nats_internal_protocol()
     opts = {
-        "servers": f"{proto}://{settings.ALLOWED_HOSTS[0]}:{nats_std_port}",
+        "servers": get_nats_url(),
         "user": "tacticalrmm",
         "name": "trmm-django",
         "password": settings.SECRET_KEY,
@@ -95,7 +135,47 @@ def days_until_cert_expires() -> int:
     cert_bytes = Path(cert_file).read_bytes()
 
     cert = x509.load_pem_x509_certificate(cert_bytes)
-    expires = cert.not_valid_after.replace(tzinfo=ZoneInfo("UTC"))
-    delta = expires - djangotime.now()
+    delta = cert.not_valid_after_utc - djangotime.now()
 
     return delta.days
+
+
+def is_weekday_in_bitmask(weekday: int, bitmask: int) -> bool:
+    bit = WEEKDAY_TO_BIT.get(weekday)
+
+    return bit & bitmask  # type: ignore
+
+
+def is_month_in_bitmask(month: int, bitmask: int) -> bool:
+    month_name = calendar.month_name[month]
+    month_bit = MONTHS.get(month_name)
+
+    return month_bit & bitmask  # type: ignore
+
+
+def has_webhook(
+    alert_templ: AlertTemplate | None, instance: Literal["agent", "check", "task"]
+) -> bool:
+    return bool(
+        alert_templ
+        and (alert_templ.action_rest or alert_templ.resolved_action_rest)
+        and (
+            (instance == "agent" and alert_templ.agent_script_actions)
+            or (instance == "check" and alert_templ.check_script_actions)
+            or (instance == "task" and alert_templ.task_script_actions)
+        )
+    )
+
+
+def has_script_actions(
+    alert_templ: AlertTemplate | None, instance: Literal["agent", "check", "task"]
+) -> bool:
+    return bool(
+        alert_templ
+        and (alert_templ.action or alert_templ.resolved_action)
+        and (
+            (instance == "agent" and alert_templ.agent_script_actions)
+            or (instance == "check" and alert_templ.check_script_actions)
+            or (instance == "task" and alert_templ.task_script_actions)
+        )
+    )
